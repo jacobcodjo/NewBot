@@ -9,7 +9,14 @@ import requests
 import websocket  # websocket-client
 
 APP_ID = os.getenv("DERIV_APP_ID", "1089")
-WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+# 1) nouvel endpoint public Deriv (sans authentification), 2) ancien endpoint en secours.
+# On peut forcer un endpoint avec la variable d'environnement DERIV_WS_URL.
+WS_URLS = [u for u in (
+    os.getenv("DERIV_WS_URL"),
+    "wss://api.derivws.com/trading/v1/options/ws/public",
+    f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}",
+) if u]
+UA = "Mozilla/5.0 (compatible; crt-bot/1.0)"
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -69,11 +76,15 @@ class Deriv:
     def _connect(self):
         self.close()
         for i in range(MAX_RETRIES):
+            url = WS_URLS[i % len(WS_URLS)]
+            name = url.split("?")[0]
             try:
-                self.ws = websocket.create_connection(WS_URL, timeout=20)
+                self.ws = websocket.create_connection(
+                    url, timeout=20, header=[f"User-Agent: {UA}"])
+                print(f"Connecté à {name}")
                 return
             except Exception as e:
-                self._sleep_backoff(i, f"connexion: {e}")
+                self._sleep_backoff(i, f"connexion {name}: {str(e)[:60]}")
         raise RuntimeError("Impossible de se connecter à Deriv")
 
     def close(self):
@@ -113,6 +124,7 @@ class Deriv:
                         self._sleep_backoff(attempt + 2, "rate limit")
                         continue
                     if code in ("InvalidSymbol", "MarketIsClosed"):
+                        print(f"Ignoré ({code}): {payload.get('ticks_history')}")
                         return None  # marché fermé / symbole indisponible
                     raise RuntimeError(f"{code}: {err.get('message')}")
                 return msg
@@ -306,10 +318,24 @@ def notify(text):
     )
 
 
+def check_symbols(api):
+    """Journalise les symboles absents chez Deriv (diagnostic uniquement)."""
+    try:
+        msg = api.request({"active_symbols": "brief", "product_type": "basic"})
+        names = {x.get("symbol") or x.get("underlying_symbol")
+                 for x in (msg or {}).get("active_symbols", [])}
+        if names:
+            missing = [s for s in SYMBOLS if s not in names]
+            print(f"Symboles Deriv : {len(names)} dispo, absents de ma liste : {missing or 'aucun'}")
+    except Exception as e:
+        print(f"check_symbols ignoré: {e}")
+
+
 def main():
     cache, state = load(CACHE_FILE), load(STATE_FILE)
     api = Deriv()
     try:
+        check_symbols(api)
         for sym in SYMBOLS:
             for htf_n, mtf_n, ltf_n in CASCADES:
                 htf = tf_candles(api, cache, sym, htf_n)
