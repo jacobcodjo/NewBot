@@ -1,4 +1,5 @@
 """Bot Candle Range Trading (CRT) - forex majeurs, or, 4 cryptos.
+Actifs : forex majeurs, or, 4 cryptos, Volatility Index 10/25/50/75/100 (+1s)
 Cascade ICT : Référence (HTF) -> Manipulation & POI (MTF) -> Confirmation (LTF)
 Données : API websocket Deriv | Alertes : Telegram
 """
@@ -25,6 +26,9 @@ SYMBOLS = [
     "frxAUDUSD", "frxUSDCAD", "frxNZDUSD",
     "frxXAUUSD",
     "cryBTCUSD", "cryETHUSD", "cryLTCUSD", "cryXRPUSD",
+    # Volatility Index (24/7) : 10, 25, 50, 75, 100 et leurs variantes 1 seconde
+    "R_10", "R_25", "R_50", "R_75", "R_100",
+    "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V",
 ]
 GRAN = {"D1": 86400, "H4": 14400, "H1": 3600, "M15": 900, "M5": 300}
 # (Référence HTF, Manipulation & POI MTF, Confirmation LTF)
@@ -39,7 +43,7 @@ KILLZONES_NY = [                   # (nom, début, fin) en heure de New York
     ("New York", 7, 10),
     ("London Close", 10, 12),
 ]
-KILLZONE_CRYPTO = False            # cryptos : pas de filtre de session (24/7)
+KILLZONE_24_7 = False              # cryptos + indices synthétiques : pas de filtre de session
 SWING_N = 2                        # fractale : 2 bougies de chaque côté
 DISP_MULT = 1.2                    # corps de la bougie de cassure vs corps moyen
 FVG_DISP_MULT = 1.5                # corps de la bougie centrale du FVG vs corps moyen
@@ -157,8 +161,17 @@ def get_candles(api, cache, symbol, gran, force=False):
 # --------------------------------------------------------------------------
 # Alignement New York (ICT) : D1/H4 ouvrent à 17h NY, reconstruits depuis le H1
 # --------------------------------------------------------------------------
-def is_crypto(sym):
-    return sym.startswith("cry")
+def is_247(sym):
+    """Cryptos et indices synthétiques : marchés 24/7, bougies natives Deriv."""
+    return sym.startswith(("cry", "R_", "1HZ"))
+
+
+def display_name(sym):
+    if sym.startswith("1HZ"):
+        return f"Volatility {sym[3:-1]} (1s)"
+    if sym.startswith("R_"):
+        return f"Volatility {sym[2:]}"
+    return sym[3:]  # retire frx / cry
 
 
 def aggregate_ny(h1, hours):
@@ -180,7 +193,7 @@ def aggregate_ny(h1, hours):
 
 
 def tf_candles(api, cache, sym, tf, force=False):
-    if NY_ALIGNED and not is_crypto(sym) and tf in ("D1", "H4"):
+    if NY_ALIGNED and not is_247(sym) and tf in ("D1", "H4"):
         h1 = get_candles(api, cache, sym, GRAN["H1"])
         return aggregate_ny(h1, 24 if tf == "D1" else 4) if h1 else None
     return get_candles(api, cache, sym, GRAN[tf], force=force)
@@ -188,7 +201,7 @@ def tf_candles(api, cache, sym, tf, force=False):
 
 def killzone(sym, epoch):
     """Nom de la session si dans une killzone, 'N/A' pour crypto sans filtre, sinon None."""
-    if is_crypto(sym) and not KILLZONE_CRYPTO:
+    if is_247(sym) and not KILLZONE_24_7:
         return "24/7"
     hour = datetime.fromtimestamp(epoch, NY).hour
     for name, a, b in KILLZONES_NY:
@@ -311,17 +324,23 @@ def confirm_ltf(ltf, poi, direction, sym):
 
 def notify(text):
     if not (TG_TOKEN and TG_CHAT):
+        print("ATTENTION : TELEGRAM_TOKEN ou TELEGRAM_CHAT_ID vide -> message NON envoyé :")
         print(text); return
-    requests.post(
-        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-        json={"chat_id": TG_CHAT, "text": text}, timeout=15,
-    )
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT, "text": text}, timeout=15,
+        )
+        if not r.ok:
+            print(f"Telegram erreur {r.status_code}: {r.text[:150]}")
+    except Exception as e:
+        print(f"Telegram injoignable: {str(e)[:100]}")
 
 
 def check_symbols(api):
     """Journalise les symboles absents chez Deriv (diagnostic uniquement)."""
     try:
-        msg = api.request({"active_symbols": "brief", "product_type": "basic"})
+        msg = api.request({"active_symbols": "brief"})
         names = {x.get("symbol") or x.get("underlying_symbol")
                  for x in (msg or {}).get("active_symbols", [])}
         if names:
@@ -334,9 +353,13 @@ def check_symbols(api):
 def main():
     cache, state = load(CACHE_FILE), load(STATE_FILE)
     api = Deriv()
+    scanned = sent = 0
+    if not (TG_TOKEN and TG_CHAT):
+        print("ATTENTION : secret Telegram manquant ou vide (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID)")
     try:
         check_symbols(api)
         for sym in SYMBOLS:
+            scanned += 1
             for htf_n, mtf_n, ltf_n in CASCADES:
                 htf = tf_candles(api, cache, sym, htf_n)
                 mtf = tf_candles(api, cache, sym, mtf_n)
@@ -360,15 +383,19 @@ def main():
                 if key in state:
                     continue
                 state[key] = int(time.time())
+                sent += 1
                 r = sw["range"]
                 notify(
-                    f"CRT {sw['dir']} | {sym[3:]} ({ltf_n})\n"
+                    f"CRT {sw['dir']} | {display_name(sym)} ({ltf_n})\n"
                     f"Session: {killzone(sym, bos)}\n"
                     f"Range: {r['low']} - {r['high']}\n"
                     f"FVG: {poi['fvg'][0]} - {poi['fvg'][1]}\n"
                     f"OB: {poi['ob'] if poi['ob'] else 'n/a'}\n"
                     f"SL: {sw['sl']} | TP: {sw['tp']}"
                 )
+        if os.getenv("NOTIFY_OK") == "1":
+            notify(f"Bot CRT OK : {scanned} symboles scannés, {sent} alerte(s).")
+        print(f"Scan terminé : {scanned} symboles, {sent} alerte(s).")
     finally:
         api.close()
         cut = time.time() - 7 * 86400
