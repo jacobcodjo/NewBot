@@ -49,6 +49,14 @@ DISP_MULT = 1.2                    # corps de la bougie de cassure vs corps moye
 FVG_DISP_MULT = 1.5                # corps de la bougie centrale du FVG vs corps moyen
 COUNT = 200
 
+# --- Entrées / sorties (critères de l'ancien Crt-Bot) ---
+STOP_LOSS_BUFFER_PCT = 0.05        # marge du SL au-delà de l'extrême du sweep (% du prix)
+TP_EXTENSION_PCT = 50               # TP3 : bord opposé du range + 50 % de sa taille (tous les actifs)
+MIN_RISK_REWARD = 3.0              # ratio minimum (1 pour 3), calculé sur TP2
+ORDER_TYPE_TOLERANCE_PCT = 0.02    # écart (% du prix) sous lequel le prix est "déjà sur la zone" -> ordre au marché
+OB_LOOKBACK = 8                    # l'OB doit se trouver à 8 bougies LTF au plus avant la cassure
+REQUIRE_FIB_OTE = False            # True : l'entrée doit tomber dans l'OTE 61,8-79 % (sinon simple indication)
+
 MIN_INTERVAL = 0.6      # s entre deux requêtes (throttle)
 MAX_RETRIES = 6
 CACHE_FILE = "cache.json"
@@ -164,6 +172,10 @@ def get_candles(api, cache, symbol, gran, force=False):
 def is_247(sym):
     """Cryptos et indices synthétiques : marchés 24/7, bougies natives Deriv."""
     return sym.startswith(("cry", "R_", "1HZ"))
+
+
+def is_synthetic(sym):
+    return sym.startswith(("R_", "1HZ", "stp"))
 
 
 def display_name(sym):
@@ -292,7 +304,7 @@ def swings(m, kind, upto):
 
 def confirm_ltf(ltf, poi, direction, sym):
     """Touche du POI, puis MSS : clôture au-delà du dernier swing, avec déplacement,
-    pendant une killzone. Retourne l'époque de la bougie de cassure ou None."""
+    pendant une killzone. Retourne {epoch, j, m} de la bougie de cassure ou None."""
     m = ltf[:-1]
     zones = [z for z in (poi["fvg"], poi["ob"]) if z]
     touch = None
@@ -318,17 +330,123 @@ def confirm_ltf(ltf, poi, direction, sym):
             continue
         if killzone(sym, m[j]["epoch"]) is None:
             continue
-        return m[j]["epoch"]
+        return {"epoch": m[j]["epoch"], "j": j, "m": m}
     return None
 
 
-def fmt(x):
-    return f"{x:.5f}".rstrip("0").rstrip(".")
+def entry_zone(m, j, d):
+    """Zone d'entrée au niveau de la cassure LTF (bougie j), par priorité :
+    Order Block, sinon Breaker Block, sinon FVG (milieu). Retourne (nom, niveau, zone)."""
+    bull = d == "BUY"
+    opposite = (lambda c: c["close"] <= c["open"]) if bull else (lambda c: c["close"] >= c["open"])
+    # 1) Order Block : dernière bougie opposée avant le mouvement qui casse la structure
+    x = j - 1
+    while x >= 0 and not opposite(m[x]):
+        x -= 1
+    if x >= 0 and j - x <= OB_LOOKBACK:
+        z = (m[x]["low"], m[x]["high"])
+        return "Order Block", (z[1] if bull else z[0]), z
+    # 2) Breaker Block : dernière bougie dans le sens du trade avant le creux (sommet) de manipulation,
+    #    dont la clôture de cassure franchit l'extrême
+    seg = range(max(0, j - 12), j)
+    if len(seg) >= 3:
+        piv = min(seg, key=lambda t: m[t]["low"]) if bull else max(seg, key=lambda t: m[t]["high"])
+        y = piv - 1
+        while y >= 0 and opposite(m[y]):
+            y -= 1
+        if y >= 0 and ((m[j]["close"] > m[y]["high"]) if bull else (m[j]["close"] < m[y]["low"])):
+            z = (m[y]["low"], m[y]["high"])
+            return "Breaker Block", (z[1] if bull else z[0]), z
+    # 3) FVG : milieu de l'écart laissé par le mouvement de cassure
+    for i in (j, j + 1):
+        if 2 <= i < len(m):
+            if bull and m[i]["low"] > m[i - 2]["high"]:
+                z = (m[i - 2]["high"], m[i]["low"])
+                return "FVG 50 %", (z[0] + z[1]) / 2, z
+            if not bull and m[i]["high"] < m[i - 2]["low"]:
+                z = (m[i]["high"], m[i - 2]["low"])
+                return "FVG 50 %", (z[0] + z[1]) / 2, z
+    return None
 
 
-def code(x):
+def order_type(d, entry, price):
+    """Buy/Sell (au marché), Buy/Sell Limit ou Buy/Sell Stop, selon l'entrée et le prix actuel."""
+    if abs(entry - price) <= price * ORDER_TYPE_TOLERANCE_PCT / 100:
+        return d
+    if d == "BUY":
+        return "BUY LIMIT" if entry < price else "BUY STOP"
+    return "SELL LIMIT" if entry > price else "SELL STOP"
+
+
+def in_ote(sw, m, entry, d):
+    """L'entrée tombe-t-elle dans le retracement 61,8-79 % du mouvement impulsif après le sweep ?"""
+    t0 = sw["closed"][sw["i"]]["epoch"]
+    seg = [c for c in m if c["epoch"] >= t0]
+    if not seg:
+        return False
+    ext = sw["sl"]
+    if d == "BUY":
+        top = max(c["high"] for c in seg)
+        leg, ratio = top - ext, (top - entry) / (top - ext) if top > ext else 0
+    else:
+        bottom = min(c["low"] for c in seg)
+        leg, ratio = ext - bottom, (entry - bottom) / (ext - bottom) if ext > bottom else 0
+    return 0.618 <= ratio <= 0.79
+
+
+def build_trade(sym, sw, bos, price):
+    """Entrée, SL, TP1-TP3, type d'ordre et R:R. Retourne None si le setup est ignoré."""
+    d, rng, m, j = sw["dir"], sw["range"], bos["m"], bos["j"]
+    buy, synth = d == "BUY", is_synthetic(sym)
+    if synth:   # indices synthétiques : entrée immédiate à la clôture de la bougie de cassure
+        entry, how = m[j]["close"], "clôture de la cassure"
+    else:
+        z = entry_zone(m, j, d)
+        if not z:
+            return None  # aucun OB, Breaker ni FVG : setup ignoré
+        how, entry = z[0], z[1]
+    hi, lo = rng["high"], rng["low"]
+    ext = sw["sl"]  # extrême de la bougie de sweep (MTF)
+    buf = ext * STOP_LOSS_BUFFER_PCT / 100
+    extra = (hi - lo) * TP_EXTENSION_PCT / 100
+    mid = (hi + lo) / 2
+    if buy:
+        sl, tp1, tp2, tp3 = ext - buf, mid, hi, hi + extra
+        ok = sl < entry < tp2
+    else:
+        sl, tp1, tp2, tp3 = ext + buf, mid, lo, lo - extra
+        ok = sl > entry > tp2
+    if not ok:
+        return None
+    rr = abs(tp2 - entry) / abs(entry - sl)  # ratio calculé sur TP2
+    ote = in_ote(sw, m, entry, d)
+    if rr < MIN_RISK_REWARD or (REQUIRE_FIB_OTE and not ote):
+        return None
+    return {"otype": order_type(d, entry, price), "entry": entry, "how": how, "sl": sl,
+            "tp1": tp1, "tp2": tp2, "tp3": tp3, "rr": rr, "ote": ote}
+
+
+def decimals(cs, cap=6):
+    """Nombre de décimales de l'actif, déduit de ses dernières bougies."""
+    d = 0
+    for c in cs[-100:]:
+        for k in ("open", "high", "low", "close"):
+            s = repr(float(c[k]))
+            if "e" in s or "E" in s or "." not in s:
+                continue
+            d = max(d, len(s.split(".")[1].rstrip("0")))
+    return min(d, cap)
+
+
+def fmt(x, dec=None):
+    if dec is None:
+        return f"{x:.5f}".rstrip("0").rstrip(".")
+    return f"{x:.{dec}f}"
+
+
+def code(x, dec=None):
     """Prix en police à espacement fixe (copiable d'un toucher dans Telegram)."""
-    return f"<code>{fmt(x)}</code>"
+    return f"<code>{fmt(x, dec)}</code>"
 
 
 def notify(text, html=False):
@@ -349,19 +467,26 @@ def notify(text, html=False):
         print(f"Telegram injoignable: {str(e)[:100]}")
 
 
-def crt_message(sym, ltf_n, d, session, price, sw, poi):
-    r = sw["range"]
+def crt_message(sym, ltf_n, session, price, sw, poi, t, dec=None):
+    c = lambda v: code(v, dec)
+    d, r = sw["dir"], sw["range"]
     lines = [
-        f"{'🟢' if d == 'BUY' else '🔴'} {d} · {display_name(sym)} · {ltf_n}",
+        f"{'🟢' if d == 'BUY' else '🔴'} {t['otype']} · {display_name(sym)} · {ltf_n}",
         f"Session : {session}", "",
-        "────────────────", f"Prix actuel  {code(price)}", "────────────────", "",
-        f"SL  {code(sw['sl'])}", f"TP  {code(sw['tp'])}", "",
-        f"Range  {code(r['low'])} - {code(r['high'])}",
-        f"✅ Sweep  {code(sw['sl'])}",
-        f"✅ FVG  {code(poi['fvg'][0])} - {code(poi['fvg'][1])}",
+        "────────────────", f"Prix actuel  {c(price)}", "────────────────", "",
+        f"Entrée  {c(t['entry'])}  ({t['how']})",
+        f"SL  {c(t['sl'])}",
+        f"TP1  {c(t['tp1'])}",
+        f"TP2  {c(t['tp2'])}   (1:{t['rr']:.1f})",
+        f"TP3  {c(t['tp3'])}", "",
+        f"Range  {c(r['low'])} - {c(r['high'])}",
+        f"✅ Sweep  {c(sw['sl'])}",
+        f"✅ FVG  {c(poi['fvg'][0])} - {c(poi['fvg'][1])}",
     ]
     if poi["ob"]:
-        lines.append(f"✅ OB  {code(poi['ob'][0])} - {code(poi['ob'][1])}")
+        lines.append(f"✅ OB  {c(poi['ob'][0])} - {c(poi['ob'][1])}")
+    if t["ote"]:
+        lines.append("✅ OTE (61,8-79 %)")
     return "\n".join(lines)
 
 
@@ -406,15 +531,18 @@ def main():
                 bos = confirm_ltf(ltf, poi, sw["dir"], sym)
                 if bos is None:
                     continue
+                price = ltf[-1]["close"]
+                trade = build_trade(sym, sw, bos, price)
+                if trade is None:
+                    continue
                 key = (f"{sym}|{htf_n}>{mtf_n}>{ltf_n}|{sw['dir']}|"
                        f"{sw['range']['epoch']}|{sw['closed'][sw['i']]['epoch']}")
                 if key in state:
                     continue
                 state[key] = int(time.time())
                 sent += 1
-                r = sw["range"]
-                notify(crt_message(sym, ltf_n, sw["dir"], killzone(sym, bos),
-                                   ltf[-1]["close"], sw, poi), html=True)
+                notify(crt_message(sym, ltf_n, killzone(sym, bos["epoch"]), price, sw, poi,
+                                   trade, decimals(ltf)), html=True)
         if os.getenv("NOTIFY_OK") == "1":
             notify(f"Bot CRT OK : {scanned} symboles scannés, {sent} alerte(s).")
         print(f"Scan terminé : {scanned} symboles, {sent} alerte(s).")

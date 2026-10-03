@@ -6,7 +6,7 @@ Les calculs sont écrits pour un achat ; pour une vente, les bougies sont invers
 """
 import os, time
 from bot import (Deriv, get_candles, load, save, notify, body_avg, swings,
-                 display_name, fmt, code, GRAN, CASCADES, CACHE_FILE)
+                 display_name, fmt, code, decimals, GRAN, CASCADES, CACHE_FILE)
 
 SYMBOLS = ["R_10", "R_25", "R_50", "R_75", "R_100",
            "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
@@ -23,6 +23,10 @@ ATR_N = 14
 SL_BUFFER_ATR = 0.15        # tampon du stop-loss (x ATR LTF)
 MIN_RR = 3.0                # ratio gain/risque minimum (1 pour 3)
 FRESH = 2                   # la cassure LTF doit dater des 2 dernières bougies clôturées
+MAX_PROGRESS = 0.5          # ordre limite rejeté si le prix a déjà fait plus de 50 % du chemin entrée -> TP1
+LATE_CANDLES = 2            # entrée tardive : le prix a quitté l'OB depuis 2 bougies au plus
+LATE_DIST = 0.5             # ... et se trouve à moins d'une demi-hauteur d'OB de son bord
+LATE_PROGRESS = 0.25        # ... et a fait moins de 25 % du chemin bord de l'OB -> TP1
 PENDING_TTL = 24 * 3600     # un ordre limite en attente expire après 24 h
 
 
@@ -141,26 +145,44 @@ def find_entry(ltf, imp, mtf_gran):
     if not found:
         return None
 
-    ob, price = found["ob"], ltf[-1]["close"]
+    ob, fvg, price = found["ob"], found["fvg"], ltf[-1]["close"]
     sl = found["sweep_low"] - SL_BUFFER_ATR * a
     tp1 = hi
-    after = m[found["i"] + 1:] + [ltf[-1]]
-    touched = any(c["low"] <= ob[1] for c in after)
     if price <= sl or price >= tp1:
         return None
-    if ob[0] <= price <= ob[1]:
-        mode, entry = "MARCHE", price           # le prix est déjà dans l'OB
-    elif price > ob[1] and not touched:
-        mode, entry = "LIMITE", (ob[0] + ob[1]) / 2   # ordre limite sur le milieu de l'OB
-    else:
-        return None                             # le prix a déjà quitté l'OB : on ne court pas après
-    risk = entry - sl
-    if risk <= 0 or (tp1 - entry) < MIN_RR * risk:
+    after = m[found["i"] + 1:] + [ltf[-1]]   # bougies depuis la fin du FVG, bougie en cours comprise
+
+    def rr_at(e):
+        return (tp1 - e) / (e - sl) if e > sl else 0
+
+    mode = entry = how = None
+    # 1) ordre limite : milieu du FVG (prioritaire), sinon extrémité de l'OB, dans la zone et pas encore atteint
+    for name, e in (("FVG 50 %", (fvg[0] + fvg[1]) / 2), ("extrémité OB", ob[1])):
+        if not (zone[0] <= e <= zone[1]) or any(c["low"] <= e for c in after):
+            continue
+        if (price - e) > MAX_PROGRESS * (tp1 - e) or rr_at(e) < MIN_RR:
+            continue
+        mode, entry, how = "LIMITE", e, name
+        break
+    # 2) ordre instantané : le prix est dans l'OB
+    if mode is None and ob[0] <= price <= ob[1] and rr_at(price) >= MIN_RR:
+        mode, entry, how = "MARCHE", price, "OB"
+    # 3) entrée tardive : le prix vient de quitter l'OB
+    if mode is None and price > ob[1]:
+        touches = [n for n, c in enumerate(after) if c["low"] <= ob[1]]
+        if touches:
+            since = len(after) - 1 - touches[-1]
+            if (since <= LATE_CANDLES
+                    and price - ob[1] <= LATE_DIST * (ob[1] - ob[0])
+                    and (price - ob[1]) < LATE_PROGRESS * (tp1 - ob[1])
+                    and rr_at(price) >= MIN_RR):
+                mode, entry, how = "MARCHE", price, "tardive"
+    if mode is None:
         return None
-    return {"mode": mode, "entry": entry, "sl": sl, "tp1": tp1,
+    return {"mode": mode, "entry": entry, "how": how, "sl": sl, "tp1": tp1,
             "tp2": lo + EXT[0] * leg, "tp3": lo + EXT[1] * leg,
-            "rr": (tp1 - entry) / risk, "ob": ob, "fvg": found["fvg"], "zone": zone,
-            "label": "Golden Zone" if (hi - (ob[0] + ob[1]) / 2) / leg < OTE[0] else "OTE",
+            "rr": rr_at(entry), "ob": ob, "fvg": fvg, "zone": zone,
+            "label": "Golden Zone" if (hi - entry) / leg < OTE[0] else "OTE",
             "sweep": found["sweep"], "price": price}
 
 
@@ -194,22 +216,26 @@ def check_pending(api, cache, pending):
         if tp_hit or sl_hit:
             why = "TP1 atteint sans exécution" if tp_hit else "stop-loss franchi avant exécution"
             notify(f"⚠️ ANNULER · {p['dir']} LIMIT · {p['name']} · {p['ltf']}\n"
-                   f"{why}\nEntrée prévue  {code(p['entry'])}", html=True)
+                   f"{why}\nEntrée prévue  {code(p['entry'], p.get('dec'))}", html=True)
             del pending[key]
 
 
-def build_message(name, ltf_n, d, r):
-    return "\n".join([
-        f"{'🟢' if d == 'BUY' else '🔴'} {d} · {name} · {ltf_n}", "",
-        "────────────────", f"Prix actuel  {code(r['price'])}", "────────────────", "",
-        f"Entrée  {code(r['entry'])}",
-        f"SL  {code(r['sl'])}",
-        f"TP1  {code(r['tp1'])}   (1:{r['rr']:.1f})",
-        f"TP2  {code(r['tp2'])}",
-        f"TP3  {code(r['tp3'])}", "",
-        f"✅ {r['label']} · OB {code(r['ob'][0])} - {code(r['ob'][1])}",
-        f"✅ Sweep  {code(r['sweep'])}",
-    ])
+def build_message(name, ltf_n, d, r, dec=None):
+    c = lambda v: code(v, dec)
+    limit = r["mode"] == "LIMITE"
+    label = f"{d} LIMIT" if limit else d
+    lines = [f"{'🟢' if d == 'BUY' else '🔴'} {label} · {name} · {ltf_n}"]
+    if r["how"] == "tardive":
+        lines.append("⏱ Entrée tardive : le prix vient de quitter l'OB")
+    lines += ["", "────────────────", f"Prix actuel  {c(r['price'])}", "────────────────", "",
+              f"Entrée  {c(r['entry'])}" + (f"  ({r['how']})" if limit else ""),
+              f"SL  {c(r['sl'])}",
+              f"TP1  {c(r['tp1'])}   (1:{r['rr']:.1f})",
+              f"TP2  {c(r['tp2'])}",
+              f"TP3  {c(r['tp3'])}", "",
+              f"✅ {r['label']} · OB {c(r['ob'][0])} - {c(r['ob'][1])}",
+              f"✅ Sweep  {c(r['sweep'])}"]
+    return "\n".join(lines)
 
 
 def main():
@@ -247,10 +273,11 @@ def main():
                     sent[key] = int(time.time())
                     alerts += 1
                     name = display_name(sym)
-                    notify(build_message(name, ltf_n, d, r), html=True)
+                    dec = decimals(ltf)
+                    notify(build_message(name, ltf_n, d, r, dec), html=True)
                     if r["mode"] == "LIMITE":
                         pending[key] = {"sym": sym, "name": name, "dir": d, "entry": r["entry"],
-                                        "sl": r["sl"], "tp1": r["tp1"], "ltf": ltf_n,
+                                        "sl": r["sl"], "tp1": r["tp1"], "ltf": ltf_n, "dec": dec,
                                         "gran": GRAN[ltf_n], "t": int(time.time())}
         print(f"Impulsion : scan terminé, {alerts} alerte(s), {len(pending)} ordre(s) en attente.")
         if os.getenv("NOTIFY_OK") == "1":

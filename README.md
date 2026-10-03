@@ -52,7 +52,17 @@ Attention : 288 exécutions par jour dépassent le quota gratuit des dépôts pr
 4. Confirmation (LTF) : le prix touche le POI, puis une clôture casse le dernier swing (fractale de 2 bougies de chaque côté), avec un corps d'au moins 1,2 fois le corps moyen. La cassure doit dater des 2 dernières bougies.
 5. Killzones (heure de New York) : Asie 20h-00h, Londres 02h-05h, New York 07h-10h, London Close 10h-12h. Les cryptos et les indices synthétiques ne sont pas filtrés.
 6. Pour le forex et l'or, D1 et H4 sont recalculés depuis le H1 avec une ouverture à 17h New York. Les autres actifs gardent les bougies natives de Deriv.
-7. SL au-delà de l'extrême du sweep, TP à l'extrême opposé du range.
+
+**Entrées et sorties (critères repris de l'ancien Crt-Bot)**
+- **Entrée, marchés réels (forex, or, cryptos) :** au niveau de la cassure de structure LTF, par ordre de priorité : Order Block (dernière bougie opposée avant le mouvement, à 8 bougies LTF au plus de la cassure), sinon Breaker Block, sinon milieu du FVG. Pour l'OB et le Breaker, le niveau est le bord que le prix atteint en premier (le haut pour un achat, le bas pour une vente). Si aucun des trois n'existe, le setup est ignoré.
+- **Entrée, indices synthétiques :** immédiate, à la clôture de la bougie de cassure de structure.
+- **Stop-loss :** au-delà de l'extrême de la bougie de sweep (MTF), avec une marge de 0,05 % du prix (`STOP_LOSS_BUFFER_PCT`).
+- **Cibles (tous les actifs) :** TP1 à mi-range (50 %), TP2 au bord opposé du range de référence (100 %), TP3 au bord opposé plus 50 % de la taille du range (`TP_EXTENSION_PCT`).
+- **Ratio :** calculé sur TP2. Une alerte n'est envoyée que si le ratio est d'au moins 1 pour 3 (`MIN_RISK_REWARD`).
+- **Type d'ordre :** déterminé en comparant l'entrée au prix actuel : `BUY`/`SELL` si le prix est déjà sur la zone (écart sous `ORDER_TYPE_TOLERANCE_PCT`), sinon `BUY LIMIT`/`SELL LIMIT` (entrée du bon côté du prix) ou `BUY STOP`/`SELL STOP`.
+- **OTE :** si l'entrée tombe dans le retracement 61,8-79 % du mouvement impulsif après le sweep, la ligne « ✅ OTE » est ajoutée. Avec `REQUIRE_FIB_OTE = True`, c'est un filtre obligatoire.
+
+Pas encore repris de l'ancien bot : le tag de contre-tendance, le suivi automatique des trades, les pools de liquidité (equal highs/lows), le filtre de gap de weekend et le backtest.
 
 ## Stratégie Impulsion (`impulse.py`)
 
@@ -63,26 +73,29 @@ Attention : 288 exécutions par jour dépassent le quota gratuit des dépôts pr
 2. Impulsion (MTF) : cassure de structure avec déplacement, sur une jambe d'au moins 2 ATR. Le Fibonacci va de l'origine (creux) à l'extrême (plus haut, mèche comprise). Le setup est annulé si une bougie MTF clôture au-delà de 79 % ou si l'origine est reprise.
 3. Zone acceptée : de 50 % à 79 % de la jambe, mesurés à partir de l'extrême.
 4. Entrée (LTF) : le prix touche la zone, balaie un creux LTF formé pendant le retracement (mèche sous le creux, clôture au-dessus), puis casse la structure avec déplacement en laissant un FVG. L'OB est la dernière bougie baissière avant ce déplacement. Il doit chevaucher la zone.
-5. Étiquette : « Golden Zone » si le milieu de l'OB est entre 50 % et 61,8 %, « OTE » entre 61,8 % et 79 %.
+5. Étiquette : « Golden Zone » si le niveau d'entrée est entre 50 % et 61,8 %, « OTE » entre 61,8 % et 79 %.
 6. SL au-delà de l'extrême du sweep, plus 0,15 ATR. TP1 à l'extrême de l'impulsion, avec un ratio minimum de 1 pour 3. TP2 et TP3 aux extensions 1,272 et 1,618.
 
-**Type d'ordre selon la position du prix au moment du scan**
-- Prix au-dessus de l'OB : ordre limite sur le milieu de l'OB (entrée différente du prix actuel).
-- Prix dans l'OB : entrée immédiate (entrée égale au prix actuel), ratio recalculé.
-- Prix déjà sorti de l'OB, SL franchi ou TP1 atteint : aucune alerte.
+**Niveaux d'entrée possibles :** le milieu du FVG (prioritaire) ou l'extrémité de l'OB (le bord que le prix atteint en premier : le haut de l'OB pour un achat, le bas pour une vente). Le niveau doit être dans la zone 50-79 %.
+
+**Types d'ordres (selon la position du prix au moment du scan)**
+1. `BUY LIMIT` / `SELL LIMIT` : le milieu du FVG est choisi s'il n'a pas encore été atteint par le prix depuis la fin du FVG, si le prix a fait au plus 50 % du chemin entre ce niveau et TP1 (`MAX_PROGRESS`), et si le ratio à ce niveau est d'au moins 1 pour 3. Sinon, le même test est fait avec l'extrémité de l'OB. Le niveau choisi est indiqué entre parenthèses sur la ligne « Entrée ».
+2. `BUY` / `SELL` (ordre instantané, sans LIMIT) : le prix est dans l'OB et les niveaux limites ne sont plus disponibles. Entrée : prix actuel, ratio recalculé, minimum 1 pour 3.
+3. `BUY` / `SELL` avec la mention « ⏱ Entrée tardive » : le prix vient de quitter l'OB. Il faut qu'il ait touché l'OB depuis 2 bougies au plus (`LATE_CANDLES`), qu'il soit à moins d'une demi-hauteur d'OB du bord de l'OB (`LATE_DIST`), qu'il ait fait moins de 25 % du chemin entre ce bord et TP1 (`LATE_PROGRESS`), et que le ratio recalculé au prix actuel soit d'au moins 1 pour 3.
+4. Aucune alerte : le stop est franchi, TP1 est atteint, le ratio est inférieur à 1 pour 3, ou le prix est déjà trop loin après avoir quitté l'OB.
 
 **Ordres limites en attente :** un message « ANNULER » est envoyé si TP1 est atteint sans exécution ou si le stop est franchi avant exécution. L'ordre en attente expire après 24 h. Une seule alerte est envoyée par impulsion.
 
 ## Format des notifications
 
 ```
-🟢 BUY · Volatility 75 · M5
+🟢 BUY LIMIT · Volatility 75 · M5
 
 ────────────────
 Prix actuel  31912.4
 ────────────────
 
-Entrée  31842.35
+Entrée  31842.35  (FVG 50 %)
 SL  31801.2
 TP1  32105.8   (1:6.4)
 TP2  32243.17
@@ -92,7 +105,7 @@ TP3  32408.44
 ✅ Sweep  31819.75
 ```
 
-Les prix sont envoyés en police à espacement fixe (balise `<code>`), copiables d'un toucher dans Telegram. Les alertes CRT suivent le même style, avec la session sous l'en-tête et ✅ sur le sweep, le FVG et l'OB.
+Les prix sont arrondis au nombre de décimales de l'actif et envoyés en police à espacement fixe (balise `<code>`), copiables d'un toucher dans Telegram. L'en-tête d'un ordre instantané ne contient que `BUY` ou `SELL`. Les alertes CRT suivent le même style : le type d'ordre dans l'en-tête (`BUY LIMIT`, `SELL STOP`, ou `BUY`/`SELL` au marché), la session sous l'en-tête, la ligne Entrée avec son origine entre parenthèses (Order Block, Breaker Block, FVG 50 % ou clôture de la cassure), SL, TP1 à TP3 avec le ratio sur TP2, puis ✅ sur le sweep, le FVG, l'OB et l'OTE le cas échéant.
 
 ## Réglages principaux
 
@@ -103,12 +116,20 @@ Les prix sont envoyés en police à espacement fixe (balise `<code>`), copiables
 | `bot.py` | `KILLZONES_NY` | Noms et horaires des sessions (heure de New York) |
 | `bot.py` | `KILLZONE_24_7` | `True` pour filtrer aussi cryptos et indices synthétiques |
 | `bot.py` | `NY_ALIGNED` | Alignement 17h New York pour le forex et l'or |
+| `bot.py` | `STOP_LOSS_BUFFER_PCT` | Marge du SL au-delà de l'extrême du sweep (% du prix) |
+| `bot.py` | `TP_EXTENSION_PCT` | Prolongement de TP3 au-delà du bord opposé du range (% de la taille du range) |
+| `bot.py` | `MIN_RISK_REWARD` | Ratio minimum du CRT, calculé sur TP2 |
+| `bot.py` | `ORDER_TYPE_TOLERANCE_PCT` | Écart sous lequel le prix est « déjà sur la zone » (ordre au marché) |
+| `bot.py` | `OB_LOOKBACK` | Distance maximale (en bougies LTF) entre l'OB et la cassure |
+| `bot.py` | `REQUIRE_FIB_OTE` | Rend l'OTE obligatoire pour une alerte CRT |
 | `bot.py` | `MIN_INTERVAL`, `MAX_RETRIES` | Débit et nombre d'essais du client Deriv |
 | `impulse.py` | `SYMBOLS` | Liste des indices de la stratégie Impulsion |
 | `impulse.py` | `ZONE` | Zone de retracement acceptée (0,5 à 0,79) |
 | `impulse.py` | `IMPULSE_ATR` | Taille minimale de la jambe (2 ATR) |
 | `impulse.py` | `MIN_RR` | Ratio gain/risque minimum (3 = 1 pour 3) |
 | `impulse.py` | `SL_BUFFER_ATR` | Tampon du stop-loss |
+| `impulse.py` | `MAX_PROGRESS` | Part maximale du chemin entrée → TP1 déjà parcourue pour un ordre limite (0,5 = 50 %) |
+| `impulse.py` | `LATE_CANDLES`, `LATE_DIST`, `LATE_PROGRESS` | Tolérance de l'entrée tardive (bougies, distance en hauteur d'OB, progression vers TP1) |
 | `impulse.py` | `FRESH` | Ancienneté maximale de la cassure LTF (en bougies) |
 | `impulse.py` | `PENDING_TTL` | Durée de vie d'un ordre limite en attente |
 
