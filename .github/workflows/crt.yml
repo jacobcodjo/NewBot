@@ -3,6 +3,11 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
+    inputs:
+      test:
+        description: "Envoyer un message de contrôle Telegram"
+        type: boolean
+        default: false
 concurrency:
   group: crt-bot
   cancel-in-progress: false
@@ -22,9 +27,17 @@ jobs:
           path: |
             cache.json
             state.json
+            impulse_state.json
           key: crt-state-${{ github.run_id }}
           restore-keys: crt-state-
       - run: python bot.py
         env:
+          NOTIFY_OK: ${{ github.event.inputs.test == 'true' && '1' || '0' }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      - run: python impulse.py
+        if: always()
+        env:
+          NOTIFY_OK: ${{ github.event.inputs.test == 'true' && '1' || '0' }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
