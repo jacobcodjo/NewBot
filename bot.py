@@ -168,7 +168,7 @@ def is_247(sym):
 
 def display_name(sym):
     if sym.startswith("1HZ"):
-        return f"Volatility {sym[3:-1]} (1s)"
+        return f"Volatility {sym[3:-1]} 1s"
     if sym.startswith("R_"):
         return f"Volatility {sym[2:]}"
     return sym[3:]  # retire frx / cry
@@ -322,19 +322,47 @@ def confirm_ltf(ltf, poi, direction, sym):
     return None
 
 
-def notify(text):
+def fmt(x):
+    return f"{x:.5f}".rstrip("0").rstrip(".")
+
+
+def code(x):
+    """Prix en police à espacement fixe (copiable d'un toucher dans Telegram)."""
+    return f"<code>{fmt(x)}</code>"
+
+
+def notify(text, html=False):
     if not (TG_TOKEN and TG_CHAT):
         print("ATTENTION : TELEGRAM_TOKEN ou TELEGRAM_CHAT_ID vide -> message NON envoyé :")
         print(text); return
+    payload = {"chat_id": TG_CHAT, "text": text}
+    if html:
+        payload["parse_mode"] = "HTML"
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": text}, timeout=15,
+            json=payload, timeout=15,
         )
         if not r.ok:
             print(f"Telegram erreur {r.status_code}: {r.text[:150]}")
     except Exception as e:
         print(f"Telegram injoignable: {str(e)[:100]}")
+
+
+def crt_message(sym, ltf_n, d, session, price, sw, poi):
+    r = sw["range"]
+    lines = [
+        f"{'🟢' if d == 'BUY' else '🔴'} {d} · {display_name(sym)} · {ltf_n}",
+        f"Session : {session}", "",
+        "────────────────", f"Prix actuel  {code(price)}", "────────────────", "",
+        f"SL  {code(sw['sl'])}", f"TP  {code(sw['tp'])}", "",
+        f"Range  {code(r['low'])} - {code(r['high'])}",
+        f"✅ Sweep  {code(sw['sl'])}",
+        f"✅ FVG  {code(poi['fvg'][0])} - {code(poi['fvg'][1])}",
+    ]
+    if poi["ob"]:
+        lines.append(f"✅ OB  {code(poi['ob'][0])} - {code(poi['ob'][1])}")
+    return "\n".join(lines)
 
 
 def check_symbols(api):
@@ -385,14 +413,8 @@ def main():
                 state[key] = int(time.time())
                 sent += 1
                 r = sw["range"]
-                notify(
-                    f"CRT {sw['dir']} | {display_name(sym)} ({ltf_n})\n"
-                    f"Session: {killzone(sym, bos)}\n"
-                    f"Range: {r['low']} - {r['high']}\n"
-                    f"FVG: {poi['fvg'][0]} - {poi['fvg'][1]}\n"
-                    f"OB: {poi['ob'] if poi['ob'] else 'n/a'}\n"
-                    f"SL: {sw['sl']} | TP: {sw['tp']}"
-                )
+                notify(crt_message(sym, ltf_n, sw["dir"], killzone(sym, bos),
+                                   ltf[-1]["close"], sw, poi), html=True)
         if os.getenv("NOTIFY_OK") == "1":
             notify(f"Bot CRT OK : {scanned} symboles scannés, {sent} alerte(s).")
         print(f"Scan terminé : {scanned} symboles, {sent} alerte(s).")

@@ -1,19 +1,20 @@
-"""Stratégie Impulsion + retracement Fibonacci (OTE) - Volatility Index Deriv.
+"""Stratégie Impulsion + retracement Fibonacci (zone 50 %-79 %) - Volatility Index Deriv.
 Cascade identique au CRT : (D1,H4,H1) (H4,H1,M15) (H1,M15,M5)
-  HTF : tendance (swings) | MTF : impulsion + Fibonacci | LTF : sweep -> MSS + FVG -> OB
+  HTF : tendance (swings) | MTF : impulsion + Fibonacci | LTF : sweep -> MSS + FVG -> OB (zone 50 %-79 %)
 Le bot n'exécute aucun ordre : il envoie des alertes Telegram (ordre limite ou entrée immédiate).
 Les calculs sont écrits pour un achat ; pour une vente, les bougies sont inversées (prix * -1).
 """
 import os, time
 from bot import (Deriv, get_candles, load, save, notify, body_avg, swings,
-                 display_name, GRAN, CASCADES, CACHE_FILE)
+                 display_name, fmt, code, GRAN, CASCADES, CACHE_FILE)
 
 SYMBOLS = ["R_10", "R_25", "R_50", "R_75", "R_100",
            "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
 STATE_FILE = "impulse_state.json"
 
-OTE = (0.62, 0.79)          # zone OTE
-GOLDEN = (0.618, 0.65)      # golden pocket (incluse dans l'OTE)
+ZONE = (0.5, 0.79)          # zone de retracement acceptée : 50 % -> 79 %
+GOLDEN_ZONE = (0.5, 0.618)  # étiquette "Golden Zone"
+OTE = (0.618, 0.79)         # étiquette "OTE"
 EXT = (1.272, 1.618)        # extensions pour TP2 / TP3
 IMPULSE_ATR = 2.0           # jambe d'impulsion >= 2 ATR
 IMPULSE_DISP = 1.5          # une bougie de la jambe >= 1,5 x corps moyen
@@ -23,10 +24,6 @@ SL_BUFFER_ATR = 0.15        # tampon du stop-loss (x ATR LTF)
 MIN_RR = 3.0                # ratio gain/risque minimum (1 pour 3)
 FRESH = 2                   # la cassure LTF doit dater des 2 dernières bougies clôturées
 PENDING_TTL = 24 * 3600     # un ordre limite en attente expire après 24 h
-
-
-def fmt(x):
-    return f"{x:.5f}".rstrip("0").rstrip(".")
 
 
 def flip(cs):
@@ -84,7 +81,7 @@ def find_impulse(mtf):
         avg = body_avg(m[max(0, o - 10):o + 1])
         if avg and max(body(x) for x in m[o + 1:e + 1]) < IMPULSE_DISP * avg:
             continue  # pas de déplacement
-        if any(x["close"] < hi - OTE[1] * leg for x in m[e + 1:]):
+        if any(x["close"] < hi - ZONE[1] * leg for x in m[e + 1:]):
             return None  # retracement trop profond (au-delà de 0,79) : setup annulé
         return {"lo": lo, "hi": hi, "leg": leg,
                 "o_epoch": m[o]["epoch"], "ext_epoch": m[e]["epoch"]}
@@ -92,12 +89,11 @@ def find_impulse(mtf):
 
 
 # --------------------------------------------------------------------------
-# 3) Entrée LTF : OTE touchée -> sweep -> MSS + FVG -> OB dans l'OTE
+# 3) Entrée LTF : zone 50-79 % touchée -> sweep -> MSS + FVG -> OB dans la zone
 # --------------------------------------------------------------------------
 def find_entry(ltf, imp, mtf_gran):
     lo, hi, leg = imp["lo"], imp["hi"], imp["leg"]
-    zone = (hi - OTE[1] * leg, hi - OTE[0] * leg)
-    gp = (hi - GOLDEN[1] * leg, hi - GOLDEN[0] * leg)
+    zone = (hi - ZONE[1] * leg, hi - ZONE[0] * leg)
     closed = ltf[:-1]
     start = imp["ext_epoch"] + mtf_gran
     first = next((i for i, c in enumerate(closed) if c["epoch"] >= start), None)
@@ -109,7 +105,7 @@ def find_entry(ltf, imp, mtf_gran):
         return None
     touch = next((i for i, c in enumerate(m) if c["low"] <= zone[1] and c["high"] >= zone[0]), None)
     if touch is None or any(c["close"] < lo for c in m):
-        return None  # OTE jamais touchée, ou origine cassée
+        return None  # zone jamais touchée, ou origine cassée
 
     found = None
     for k in range(touch, len(m)):
@@ -139,7 +135,7 @@ def find_entry(ltf, imp, mtf_gran):
                 continue
             ob = (m[ob_i]["low"], m[ob_i]["high"])
             if not (ob[0] <= zone[1] and ob[1] >= zone[0]):
-                continue  # l'OB doit chevaucher l'OTE
+                continue  # l'OB doit chevaucher la zone 50 %-79 %
             found = {"k": k, "i": i, "ob": ob, "fvg": (m[i - 2]["high"], m[i]["low"]),
                      "sweep": max(swept), "sweep_low": m[k]["low"]}
     if not found:
@@ -164,7 +160,7 @@ def find_entry(ltf, imp, mtf_gran):
     return {"mode": mode, "entry": entry, "sl": sl, "tp1": tp1,
             "tp2": lo + EXT[0] * leg, "tp3": lo + EXT[1] * leg,
             "rr": (tp1 - entry) / risk, "ob": ob, "fvg": found["fvg"], "zone": zone,
-            "golden": ob[0] <= gp[1] and ob[1] >= gp[0],
+            "label": "Golden Zone" if (hi - (ob[0] + ob[1]) / 2) / leg < OTE[0] else "OTE",
             "sweep": found["sweep"], "price": price}
 
 
@@ -197,27 +193,23 @@ def check_pending(api, cache, pending):
         sl_hit = any((x["close"] < p["sl"]) if buy else (x["close"] > p["sl"]) for x in cs)
         if tp_hit or sl_hit:
             why = "TP1 atteint sans exécution" if tp_hit else "stop-loss franchi avant exécution"
-            notify(f"ANNULER l'ordre {p['dir']} LIMIT | {p['name']} ({p['ltf']})\n"
-                   f"{why}\nEntrée prévue : {fmt(p['entry'])}")
+            notify(f"⚠️ ANNULER · {p['dir']} LIMIT · {p['name']} · {p['ltf']}\n"
+                   f"{why}\nEntrée prévue  {code(p['entry'])}", html=True)
             del pending[key]
 
 
 def build_message(name, ltf_n, d, r):
-    if r["mode"] == "LIMITE":
-        order = f"Ordre : {d} LIMIT sur le milieu de l'OB"
-    else:
-        order = "Ordre : ENTRÉE AU MARCHÉ (prix dans l'OB)"
-    zone = "Golden pocket (0,618-0,65)" if r["golden"] else "OTE (0,62-0,79)"
-    return (
-        f"IMPULSION {d} | {name} ({ltf_n})\n{order}\n"
-        f"Entrée : {fmt(r['entry'])} | Prix actuel : {fmt(r['price'])}\n"
-        f"SL : {fmt(r['sl'])}\n"
-        f"TP1 : {fmt(r['tp1'])} (ratio 1:{r['rr']:.1f})\n"
-        f"TP2 : {fmt(r['tp2'])} | TP3 : {fmt(r['tp3'])}\n"
-        f"Zone : {zone} | OTE : {fmt(r['zone'][0])} - {fmt(r['zone'][1])}\n"
-        f"OB : {fmt(r['ob'][0])} - {fmt(r['ob'][1])} | FVG : {fmt(r['fvg'][0])} - {fmt(r['fvg'][1])}\n"
-        f"Liquidité balayée : {fmt(r['sweep'])}"
-    )
+    return "\n".join([
+        f"{'🟢' if d == 'BUY' else '🔴'} {d} · {name} · {ltf_n}", "",
+        "────────────────", f"Prix actuel  {code(r['price'])}", "────────────────", "",
+        f"Entrée  {code(r['entry'])}",
+        f"SL  {code(r['sl'])}",
+        f"TP1  {code(r['tp1'])}   (1:{r['rr']:.1f})",
+        f"TP2  {code(r['tp2'])}",
+        f"TP3  {code(r['tp3'])}", "",
+        f"✅ {r['label']} · OB {code(r['ob'][0])} - {code(r['ob'][1])}",
+        f"✅ Sweep  {code(r['sweep'])}",
+    ])
 
 
 def main():
@@ -255,7 +247,7 @@ def main():
                     sent[key] = int(time.time())
                     alerts += 1
                     name = display_name(sym)
-                    notify(build_message(name, ltf_n, d, r))
+                    notify(build_message(name, ltf_n, d, r), html=True)
                     if r["mode"] == "LIMITE":
                         pending[key] = {"sym": sym, "name": name, "dir": d, "entry": r["entry"],
                                         "sl": r["sl"], "tp1": r["tp1"], "ltf": ltf_n,
