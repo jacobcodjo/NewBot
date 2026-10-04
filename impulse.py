@@ -6,7 +6,7 @@ Les calculs sont écrits pour un achat ; pour une vente, les bougies sont invers
 """
 import os, time
 from bot import (Deriv, get_candles, load, save, notify, body_avg, swings,
-                 display_name, fmt, code, decimals, GRAN, CASCADES, CACHE_FILE)
+                 display_name, fmt, code, decimals, ratio_txt, GRAN, CASCADES, CACHE_FILE)
 
 SYMBOLS = ["R_10", "R_25", "R_50", "R_75", "R_100",
            "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
@@ -215,7 +215,7 @@ def check_pending(api, cache, pending):
         sl_hit = any((x["close"] < p["sl"]) if buy else (x["close"] > p["sl"]) for x in cs)
         if tp_hit or sl_hit:
             why = "TP1 atteint sans exécution" if tp_hit else "stop-loss franchi avant exécution"
-            notify(f"⚠️ ANNULER · {p['dir']} LIMIT · {p['name']} · {p['ltf']}\n"
+            notify(f"⚠️ ANNULER · {p['dir']} LIMIT · {p['name']} · {p['ltf']} · Impulsion\n"
                    f"{why}\nEntrée prévue  {code(p['entry'], p.get('dec'))}", html=True)
             del pending[key]
 
@@ -224,15 +224,15 @@ def build_message(name, ltf_n, d, r, dec=None):
     c = lambda v: code(v, dec)
     limit = r["mode"] == "LIMITE"
     label = f"{d} LIMIT" if limit else d
-    lines = [f"{'🟢' if d == 'BUY' else '🔴'} {label} · {name} · {ltf_n}"]
+    lines = [f"{'🟢' if d == 'BUY' else '🔴'} {label} · {name} · {ltf_n} · Impulsion"]
     if r["how"] == "tardive":
         lines.append("⏱ Entrée tardive : le prix vient de quitter l'OB")
     lines += ["", "────────────────", f"Prix actuel  {c(r['price'])}", "────────────────", "",
               f"Entrée  {c(r['entry'])}" + (f"  ({r['how']})" if limit else ""),
               f"SL  {c(r['sl'])}",
-              f"TP1  {c(r['tp1'])}   (1:{r['rr']:.1f})",
-              f"TP2  {c(r['tp2'])}",
-              f"TP3  {c(r['tp3'])}", "",
+              f"TP1  {c(r['tp1'])}{ratio_txt(d, r['entry'], r['sl'], r['tp1'])}",
+              f"TP2  {c(r['tp2'])}{ratio_txt(d, r['entry'], r['sl'], r['tp2'])}",
+              f"TP3  {c(r['tp3'])}{ratio_txt(d, r['entry'], r['sl'], r['tp3'])}", "",
               f"✅ {r['label']} · OB {c(r['ob'][0])} - {c(r['ob'][1])}",
               f"✅ Sweep  {c(r['sweep'])}"]
     return "\n".join(lines)

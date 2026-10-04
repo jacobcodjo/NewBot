@@ -467,18 +467,27 @@ def notify(text, html=False):
         print(f"Telegram injoignable: {str(e)[:100]}")
 
 
+def ratio_txt(d, entry, sl, tp):
+    """Ratio gain/risque d'une cible, ex. '   (1:4.9)'."""
+    risk = abs(entry - sl)
+    gain = (tp - entry) if d == "BUY" else (entry - tp)
+    if risk <= 0:
+        return ""
+    return "   (dépassé)" if gain <= 0 else f"   (1:{gain / risk:.1f})"
+
+
 def crt_message(sym, ltf_n, session, price, sw, poi, t, dec=None):
     c = lambda v: code(v, dec)
     d, r = sw["dir"], sw["range"]
     lines = [
-        f"{'🟢' if d == 'BUY' else '🔴'} {t['otype']} · {display_name(sym)} · {ltf_n}",
+        f"{'🟢' if d == 'BUY' else '🔴'} {t['otype']} · {display_name(sym)} · {ltf_n} · CRT",
         f"Session : {session}", "",
         "────────────────", f"Prix actuel  {c(price)}", "────────────────", "",
         f"Entrée  {c(t['entry'])}  ({t['how']})",
         f"SL  {c(t['sl'])}",
-        f"TP1  {c(t['tp1'])}",
-        f"TP2  {c(t['tp2'])}   (1:{t['rr']:.1f})",
-        f"TP3  {c(t['tp3'])}", "",
+        f"TP1  {c(t['tp1'])}{ratio_txt(d, t['entry'], t['sl'], t['tp1'])}",
+        f"TP2  {c(t['tp2'])}{ratio_txt(d, t['entry'], t['sl'], t['tp2'])}",
+        f"TP3  {c(t['tp3'])}{ratio_txt(d, t['entry'], t['sl'], t['tp3'])}", "",
         f"Range  {c(r['low'])} - {c(r['high'])}",
         f"✅ Sweep  {c(sw['sl'])}",
         f"✅ FVG  {c(poi['fvg'][0])} - {c(poi['fvg'][1])}",

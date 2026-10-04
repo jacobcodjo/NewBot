@@ -89,7 +89,7 @@ Pas encore repris de l'ancien bot : le tag de contre-tendance, le suivi automati
 ## Format des notifications
 
 ```
-🟢 BUY LIMIT · Volatility 75 · M5
+🟢 BUY LIMIT · Volatility 75 · M5 · Impulsion
 
 ────────────────
 Prix actuel  31912.4
@@ -98,14 +98,14 @@ Prix actuel  31912.4
 Entrée  31842.35  (FVG 50 %)
 SL  31801.2
 TP1  32105.8   (1:6.4)
-TP2  32243.17
-TP3  32408.44
+TP2  32243.17   (1:9.7)
+TP3  32408.44   (1:13.8)
 
 ✅ Golden Zone · OB 31828.1 - 31856.6
 ✅ Sweep  31819.75
 ```
 
-Les prix sont arrondis au nombre de décimales de l'actif et envoyés en police à espacement fixe (balise `<code>`), copiables d'un toucher dans Telegram. L'en-tête d'un ordre instantané ne contient que `BUY` ou `SELL`. Les alertes CRT suivent le même style : le type d'ordre dans l'en-tête (`BUY LIMIT`, `SELL STOP`, ou `BUY`/`SELL` au marché), la session sous l'en-tête, la ligne Entrée avec son origine entre parenthèses (Order Block, Breaker Block, FVG 50 % ou clôture de la cassure), SL, TP1 à TP3 avec le ratio sur TP2, puis ✅ sur le sweep, le FVG, l'OB et l'OTE le cas échéant.
+Chaque TP affiche son ratio gain/risque, calculé depuis l'entrée prévue (le filtre de l'Impulsion porte sur TP1). Les prix sont arrondis au nombre de décimales de l'actif et envoyés en police à espacement fixe (balise `<code>`), copiables d'un toucher dans Telegram. L'en-tête d'un ordre instantané ne contient que `BUY` ou `SELL`. Il se termine par le nom de la stratégie (`CRT` ou `Impulsion`), y compris sur le message d'annulation. Les alertes CRT suivent le même style : le type d'ordre dans l'en-tête (`BUY LIMIT`, `SELL STOP`, ou `BUY`/`SELL` au marché), la session sous l'en-tête, la ligne Entrée avec son origine entre parenthèses (Order Block, Breaker Block, FVG 50 % ou clôture de la cassure), SL, TP1 à TP3 avec le ratio de chaque cible (le filtre de 1 pour 3 porte sur TP2), puis ✅ sur le sweep, le FVG, l'OB et l'OTE le cas échéant.
 
 ## Réglages principaux
 
