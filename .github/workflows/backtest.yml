@@ -1,0 +1,37 @@
+name: CRT Backtest
+on:
+  workflow_dispatch:
+    inputs:
+      strategy:
+        description: "Stratégie : crt (45 jours max) ou impulse (16 jours max)"
+        type: choice
+        options:
+          - crt
+          - impulse
+        default: crt
+      days:
+        description: "Durée rejouée en jours"
+        default: "30"
+      symbols:
+        description: "Symboles séparés par des virgules (vide = tous)"
+        default: ""
+concurrency:
+  group: crt-backtest
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python backtest.py --strategy "${{ github.event.inputs.strategy }}" --days "${{ github.event.inputs.days }}" --symbols "${{ github.event.inputs.symbols }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backtest-${{ github.event.inputs.strategy }}
+          path: backtest_*.csv

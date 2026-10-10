@@ -26,6 +26,9 @@ jobs:
             cache.json
             state.json
             impulse_state.json
+            trade_stats.json
+            trade_stats_impulse.json
+            weekly_outlook_state.json
           key: crt-state-${{ github.run_id }}
           restore-keys: crt-state-
       - run: python bot.py
@@ -34,6 +37,12 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       - run: python impulse.py
+        if: always()
+        env:
+          NOTIFY_OK: ${{ github.event.inputs.test == 'true' && '1' || '0' }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      - run: python outlook.py
         if: always()
         env:
           NOTIFY_OK: ${{ github.event.inputs.test == 'true' && '1' || '0' }}
