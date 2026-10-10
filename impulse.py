@@ -5,12 +5,14 @@ Le bot n'exécute aucun ordre : il envoie des alertes Telegram (ordre limite ou 
 Les calculs sont écrits pour un achat ; pour une vente, les bougies sont inversées (prix * -1).
 """
 import os, time
-from bot import (Deriv, get_candles, load, save, notify, body_avg, swings,
+import tracker
+from bot import (Deriv, get_candles, load, save, notify, body_avg, swings, detect_trend,
                  display_name, fmt, code, decimals, ratio_txt, GRAN, CASCADES, CACHE_FILE)
 
 SYMBOLS = ["R_10", "R_25", "R_50", "R_75", "R_100",
            "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
 STATE_FILE = "impulse_state.json"
+STATS_FILE = "trade_stats_impulse.json"   # suivi des trades de l'Impulsion (tracker.py)
 
 ZONE = (0.5, 0.79)          # zone de retracement acceptée : 50 % -> 79 %
 GOLDEN_ZONE = (0.5, 0.618)  # étiquette "Golden Zone"
@@ -28,6 +30,8 @@ LATE_CANDLES = 2            # entrée tardive : le prix a quitté l'OB depuis 2 
 LATE_DIST = 0.5             # ... et se trouve à moins d'une demi-hauteur d'OB de son bord
 LATE_PROGRESS = 0.25        # ... et a fait moins de 25 % du chemin bord de l'OB -> TP1
 PENDING_TTL = 24 * 3600     # un ordre limite en attente expire après 24 h
+STRICT_TREND = True         # True : 3 sommets et 3 creux consécutifs + SMA 50 (filtre de pa-bot) ;
+                            # False : ancienne règle, 2 derniers sommets et creux plus hauts
 
 
 def flip(cs):
@@ -47,9 +51,13 @@ def body(c):
 
 
 # --------------------------------------------------------------------------
-# 1) Tendance HTF : sommets et creux de plus en plus hauts
+# 1) Tendance HTF : sommets et creux de plus en plus hauts (3 swings + SMA 50 si STRICT_TREND)
 # --------------------------------------------------------------------------
 def trend_up(htf):
+    if STRICT_TREND:
+        # même lecture de tendance que le CRT et le récapitulatif hebdomadaire (bot.detect_trend) :
+        # 3 sommets ET 3 creux consécutifs plus hauts, prix au-dessus de la SMA 50 (série retournée pour une vente)
+        return detect_trend(htf) == "bullish"
     h = htf[:-1]
     if len(h) < 12:
         return False
@@ -238,56 +246,83 @@ def build_message(name, ltf_n, d, r, dec=None):
     return "\n".join(lines)
 
 
+def analyze(sym, get, now=None):
+    """Setups d'un symbole. get(tf, force=False) -> bougies du timeframe (la dernière est en formation).
+    Fonction pure vis-à-vis de l'état : utilisée par main() et par backtest.py."""
+    now = time.time() if now is None else now
+    out = []
+    for htf_n, mtf_n, ltf_n in CASCADES:
+        htf, mtf = get(htf_n), get(mtf_n)
+        if not htf or not mtf:
+            continue
+        ltf = None
+        for d in ("BUY", "SELL"):
+            H, M = (htf, mtf) if d == "BUY" else (flip(htf), flip(mtf))
+            if not trend_up(H):
+                continue
+            imp = find_impulse(M)
+            if not imp:
+                continue
+            if ltf is None:
+                ltf = get(ltf_n, True) or []
+            if not ltf or now - ltf[-1]["epoch"] > 3 * GRAN[ltf_n]:
+                continue
+            r = find_entry(ltf if d == "BUY" else flip(ltf), imp, GRAN[mtf_n])
+            if not r:
+                continue
+            if d == "SELL":
+                r = unflip(r)
+            limit = r["mode"] == "LIMITE"
+            out.append({
+                "sym": sym, "dir": d, "ref_n": htf_n, "conf_n": ltf_n, "r": r, "dec": decimals(ltf),
+                "key": f"{sym}|{htf_n}>{mtf_n}>{ltf_n}|{d}|{imp['o_epoch']}|{imp['ext_epoch']}",
+                "counter": False, "win": "tp1", "max_age": PENDING_TTL,
+                "trade": {"otype": f"{d} LIMIT" if limit else d, "entry": r["entry"], "sl": r["sl"],
+                          "tp1": r["tp1"], "tp2": r["tp2"], "tp3": r["tp3"], "rr": r["rr"]},
+            })
+    return out
+
+
 def main():
-    cache, st = load(CACHE_FILE), load(STATE_FILE)
+    cache, st, stats = load(CACHE_FILE), load(STATE_FILE), tracker.load_stats(STATS_FILE)
     sent, pending = st.setdefault("sent", {}), st.setdefault("pending", {})
     api, alerts = Deriv(), 0
     try:
         check_pending(api, cache, pending)
         for sym in SYMBOLS:
-            for htf_n, mtf_n, ltf_n in CASCADES:
-                htf = get_candles(api, cache, sym, GRAN[htf_n])
-                mtf = get_candles(api, cache, sym, GRAN[mtf_n])
-                if not htf or not mtf:
-                    continue
-                ltf = None
-                for d in ("BUY", "SELL"):
-                    H, M = (htf, mtf) if d == "BUY" else (flip(htf), flip(mtf))
-                    if not trend_up(H):
-                        continue
-                    imp = find_impulse(M)
-                    if not imp:
-                        continue
-                    if ltf is None:
-                        ltf = get_candles(api, cache, sym, GRAN[ltf_n], force=True) or []
-                    if not ltf or time.time() - ltf[-1]["epoch"] > 3 * GRAN[ltf_n]:
-                        continue
-                    r = find_entry(ltf if d == "BUY" else flip(ltf), imp, GRAN[mtf_n])
-                    if not r:
-                        continue
-                    if d == "SELL":
-                        r = unflip(r)
-                    key = f"{sym}|{htf_n}>{mtf_n}>{ltf_n}|{d}|{imp['o_epoch']}|{imp['ext_epoch']}"
-                    if key in sent:
-                        continue  # une seule alerte par impulsion
-                    sent[key] = int(time.time())
-                    alerts += 1
-                    name = display_name(sym)
-                    dec = decimals(ltf)
-                    notify(build_message(name, ltf_n, d, r, dec), html=True)
-                    if r["mode"] == "LIMITE":
-                        pending[key] = {"sym": sym, "name": name, "dir": d, "entry": r["entry"],
-                                        "sl": r["sl"], "tp1": r["tp1"], "ltf": ltf_n, "dec": dec,
-                                        "gran": GRAN[ltf_n], "t": int(time.time())}
+            get = lambda tf, force=False, sym=sym: get_candles(api, cache, sym, GRAN[tf], force=force)
+            for s in analyze(sym, get):
+                key, d, r = s["key"], s["dir"], s["r"]
+                if key in sent:
+                    continue  # une seule alerte par impulsion
+                now = int(time.time())
+                sent[key] = now
+                alerts += 1
+                name = display_name(sym)
+                notify(build_message(name, s["conf_n"], d, r, s["dec"]), html=True)
+                tracker.add_pending(stats, key, s, now)
+                if r["mode"] == "LIMITE":
+                    pending[key] = {"sym": sym, "name": name, "dir": d, "entry": r["entry"],
+                                    "sl": r["sl"], "tp1": r["tp1"], "ltf": s["conf_n"], "dec": s["dec"],
+                                    "gran": GRAN[s["conf_n"]], "t": now}
+        # suivi des trades : remplissage, SL / TP1, expiration, purge
+        lookup = lambda sym, tf: get_candles(api, cache, sym, GRAN[tf])
+        done = tracker.resolve_pending(stats, lookup)
+        expired, pruned = tracker.expire_stale_pending(stats), tracker.prune_history(stats)
+        if done or expired or pruned:
+            print(f"Suivi Impulsion : {len(done)} archivé(s), {expired} expiré(s), {pruned} purgé(s).")
+        summary = tracker.summarize(stats, "Impulsion", win="tp1")
         print(f"Impulsion : scan terminé, {alerts} alerte(s), {len(pending)} ordre(s) en attente.")
+        print(summary)
         if os.getenv("NOTIFY_OK") == "1":
-            notify(f"Impulsion OK : {len(SYMBOLS)} indices scannés, {alerts} alerte(s).")
+            notify(f"Impulsion OK : {len(SYMBOLS)} indices scannés, {alerts} alerte(s).\n{summary}")
     finally:
         api.close()
         cut = time.time() - 7 * 86400
         st["sent"] = {k: v for k, v in sent.items() if v > cut}
         save(CACHE_FILE, cache)
         save(STATE_FILE, st)
+        tracker.save_stats(stats, STATS_FILE)
 
 
 if __name__ == "__main__":
