@@ -55,9 +55,15 @@ REFERENCE_CONFIRMATION_MAP = {"W1": ["H4"], "D1": ["H1"], "H4": ["M15"]}
 STRUCTURE_SWING_WINDOW = {"M15": 1}
 DEFAULT_STRUCTURE_SWING_WINDOW = 2
 # Tendance de fond (D1 pour le CRT, HTF pour l'Impulsion, D1 et W1 pour le récapitulatif)
-TREND_MODE = os.getenv("TREND_MODE", "structure")   # "structure" (précoce) ou "swings" (ancienne règle, plus tardive)
-if TREND_MODE not in ("structure", "swings"):
+TREND_MODES = ("structure", "deplacement", "swings")
+TREND_MODE = os.getenv("TREND_MODE", "structure")   # structure (précoce) | deplacement (structure + cassure impulsive)
+if TREND_MODE not in TREND_MODES:                   # | swings (ancienne règle, 3 swings + SMA 50, tardive)
     TREND_MODE = "structure"
+TREND_DISP_BODY_MULT = 1.5         # mode deplacement : corps de la bougie de cassure >= 1,5 x corps moyen des 10 bougies précédentes
+TREND_DISP_ATR_FRAC = 0.25         # ... et clôture au-delà du pivot d'au moins 0,25 ATR (14)
+TREND_DISP_REQUIRE_BOTH = True     # True : les deux conditions (corps ET distance) ; False : l'une des deux (filtre très léger)
+TREND_DISP_CONFIRM = 1             # la cassure est validée si la bougie de cassure ou la suivante est impulsive
+TREND_MATURE_SWINGS = 3            # alignements successifs (sommets ET creux) à partir desquels la tendance est « mûre »
 TREND_STRUCTURE_WINDOW = 3         # mode structure : un swing est confirmé 3 bougies après (4 pour l'ancien mode)
 TREND_SWING_WINDOW = 4             # mode swings : fenêtre des swings
 TREND_SWING_COUNT = 3              # mode swings : 3 sommets ET 3 creux consécutifs dans le même sens
@@ -420,30 +426,87 @@ def trend_pivots(closed, w):
     return hi, lo
 
 
-def detect_trend_structure(cs):
+def _atr_before(cs, end, n=14):
+    """ATR simple des n bougies qui précèdent l'indice end."""
+    trs = [max(cs[i]["high"] - cs[i]["low"], abs(cs[i]["high"] - cs[i - 1]["close"]),
+               abs(cs[i]["low"] - cs[i - 1]["close"])) for i in range(max(1, end - n), end)]
+    return sum(trs) / len(trs) if trs else 0.0
+
+
+def break_displaced(closed, pivot_i, level, up):
+    """La cassure du pivot (indice pivot_i, prix level) est-elle impulsive ? On prend la première clôture
+    au-delà du niveau après le pivot ; elle est validée si elle, ou l'une des TREND_DISP_CONFIRM bougies
+    suivantes qui clôture aussi au-delà, est dirigée dans le bon sens avec un corps >= TREND_DISP_BODY_MULT x
+    le corps moyen des 10 bougies précédentes ET une clôture à au moins TREND_DISP_ATR_FRAC x ATR du niveau
+    (l'une des deux seulement si TREND_DISP_REQUIRE_BOTH est faux).
+    Une mèche qui dépasse le niveau sans clôture au-delà n'est pas une cassure."""
+    n = len(closed)
+    jb = next((j for j in range(pivot_i + 1, n)
+               if (closed[j]["close"] > level if up else closed[j]["close"] < level)), None)
+    if jb is None:
+        return False
+    for j in range(jb, min(jb + TREND_DISP_CONFIRM + 1, n)):
+        c = closed[j]
+        beyond = c["close"] - level if up else level - c["close"]
+        if beyond <= 0 or (c["close"] > c["open"]) != up:
+            continue
+        prev = closed[max(0, j - 10):j]
+        avg = sum(abs(p["close"] - p["open"]) for p in prev) / len(prev) if prev else 0.0
+        big_body = avg > 0 and abs(c["close"] - c["open"]) >= TREND_DISP_BODY_MULT * avg
+        far = beyond >= TREND_DISP_ATR_FRAC * _atr_before(closed, j)
+        if (big_body and far) if TREND_DISP_REQUIRE_BOTH else (big_body or far):
+            return True
+    return False
+
+
+def _rises(vals, extra=0):
+    """Nombre de hausses consécutives en fin de liste de prix (+ extra si le cours a déjà dépassé le dernier)."""
+    k = 0
+    while k + 1 < len(vals) and vals[-1 - k] > vals[-2 - k]:
+        k += 1
+    return k + extra
+
+
+def trend_structure_info(cs, displacement=False):
     """Tendance par structure de marché (précoce). Haussière si, sur les pivots confirmés :
     - les deux derniers creux montent (higher low) ;
     - ET soit les deux derniers sommets montent (higher high), soit le dernier cours clôture
-      au-dessus du dernier sommet (cassure de structure : le début de tendance compte, pas besoin
-      d'attendre un second sommet plus haut) ;
+      au-dessus du dernier sommet (cassure de structure : pas besoin d'attendre un second sommet) ;
     - ET le dernier cours reste au-dessus du dernier creux (sinon la structure est cassée : la
       tendance est déclarée finie dès la cassure, sans attendre un swing de plus).
-    Baissière : miroir. Sinon « range ». Il suffit de 2 sommets et 2 creux, au lieu de 3 et 3 + SMA 50."""
+    Avec displacement=True, la dernière cassure de sommet (celle qui a créé le dernier sommet plus haut, ou
+    celle du dernier sommet par le cours) doit être impulsive (break_displaced) : sans cela, « range ».
+    Baissière : miroir. Retourne {'trend', 'age', 'swings'} : age = naissante (1 alignement), établie (2),
+    mûre (TREND_MATURE_SWINGS et plus), avec swings = nombre d'alignements successifs (sommets ET creux)."""
     closed = cs[:-1] if len(cs) > 1 else cs
     w = TREND_STRUCTURE_WINDOW
+    none = {"trend": None, "age": None, "swings": None}
     if len(closed) < 4 * w:
-        return None
+        return none
     hi, lo = trend_pivots(closed, w)
     if len(hi) < 2 or len(lo) < 2:
-        return None
-    h1, h2 = closed[hi[-1]]["high"], closed[hi[-2]]["high"]
-    l1, l2 = closed[lo[-1]]["low"], closed[lo[-2]]["low"]
+        return none
+    hv, lv = [closed[i]["high"] for i in hi[-8:]], [closed[i]["low"] for i in lo[-8:]]
+    h1, h2, l1, l2 = hv[-1], hv[-2], lv[-1], lv[-2]
     px = closed[-1]["close"]
-    if l1 > l2 and (h1 > h2 or px > h1) and px > l1:
-        return "bullish"
-    if h1 < h2 and (l1 < l2 or px < l1) and px < h1:
-        return "bearish"
-    return "range"
+
+    if l1 > l2 and px > l1:
+        up_ok = (h1 > h2 and (not displacement or break_displaced(closed, hi[-2], h2, True))) or \
+                (px > h1 and (not displacement or break_displaced(closed, hi[-1], h1, True)))
+        if up_ok:
+            k = min(_rises(hv, 1 if px > h1 else 0), _rises(lv))
+            return {"trend": "bullish", "age": _age(k), "swings": k}
+    if h1 < h2 and px < h1:
+        dn_ok = (l1 < l2 and (not displacement or break_displaced(closed, lo[-2], l2, False))) or \
+                (px < l1 and (not displacement or break_displaced(closed, lo[-1], l1, False)))
+        if dn_ok:
+            k = min(_rises([-v for v in lv], 1 if px < l1 else 0), _rises([-v for v in hv]))
+            return {"trend": "bearish", "age": _age(k), "swings": k}
+    return {"trend": "range", "age": None, "swings": None}
+
+
+def _age(k):
+    return "naissante" if k <= 1 else ("établie" if k < TREND_MATURE_SWINGS else "mûre")
 
 
 def detect_trend_swings(cs):
@@ -466,10 +529,19 @@ def detect_trend_swings(cs):
     return "range"
 
 
+def trend_info(cs, mode=None):
+    """Tendance de fond avec son âge : {'trend': 'bullish'|'bearish'|'range'|None, 'age', 'swings'}.
+    La dernière bougie de cs (en formation) est ignorée. Règle choisie par `mode` ou TREND_MODE ;
+    le mode swings (ancienne règle) ne calcule pas d'âge."""
+    mode = mode or TREND_MODE
+    if mode == "swings":
+        return {"trend": detect_trend_swings(cs), "age": None, "swings": None}
+    return trend_structure_info(cs, displacement=(mode == "deplacement"))
+
+
 def detect_trend(cs):
-    """Tendance de fond : 'bullish', 'bearish', 'range' ou None (historique insuffisant).
-    La dernière bougie (en formation) est ignorée. Règle choisie par TREND_MODE."""
-    return detect_trend_structure(cs) if TREND_MODE == "structure" else detect_trend_swings(cs)
+    """Tendance de fond : 'bullish', 'bearish', 'range' ou None (historique insuffisant)."""
+    return trend_info(cs)["trend"]
 
 
 def is_stale(d, j, t, cs):
@@ -492,7 +564,8 @@ def setup_keys(s):
 
 def analyze(sym, htf, ltf_by_tf):
     """Cherche les setups CRT d'un symbole : sweep -> cassure de structure -> FVG et/ou OB."""
-    trend = detect_trend(htf["D1"]) if htf.get("D1") else None
+    info = trend_info(htf["D1"]) if htf.get("D1") else {"trend": None, "age": None}
+    trend = info["trend"]
     check_gaps = sym.startswith(WEEKEND_GAP_PREFIXES)
     setups = []
     for ref_n, conf_list in REFERENCE_CONFIRMATION_MAP.items():
@@ -535,7 +608,7 @@ def analyze(sym, htf, ltf_by_tf):
                     "price": price, "session": session,
                     "grabbed": near_level(ext, swept_pools),
                     "counter": (trend == "bullish" and d == "SELL") or (trend == "bearish" and d == "BUY"),
-                    "trend": trend,
+                    "trend": trend, "trend_age": info["age"],
                 })
     return setups
 

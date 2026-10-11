@@ -18,6 +18,7 @@ MARKER_FILE = "weekly_outlook_state.json"
 DISPLAY_TZ = "Africa/Lagos"          # fuseau d'affichage de l'heure (UTC+1 fixe, comme pa-bot)
 D1_COUNT = 500                        # le W1 (SMA 50 semaines) demande bien plus que les 200 bougies du scan
 OUTLOOK_INCLUDE_SYNTHETIC = True      # False : forex, or et cryptos seulement
+OUTLOOK_SHOW_AGE = True               # True : ajoute l'âge de la tendance (naissante, établie, mûre) quand il existe
 REFRESH_HOUR_UTC = 20                 # mise à jour 24/7 du dimanche, à partir de cette heure
 FOREX_CLOSE_UTC = (4, 22)             # (jour, heure) : vendredi 22h UTC
 FOREX_OPEN_UTC = (6, 22)              # dimanche 22h UTC
@@ -89,10 +90,10 @@ def trends(sym, cs, now):
     """Biais D1 et W1. Au week-end, la semaine ISO en cours est considérée comme terminée."""
     closed = closed_d1(sym, cs, now)
     if len(closed) < 2:
-        return {"d1": None, "w1": None}
+        return {"d1": None, "w1": None, "d1_age": None, "w1_age": None}
     weekly = weekly_candles(closed)
-    return {"d1": bot.detect_trend(with_forming(closed, 86400)),
-            "w1": bot.detect_trend(with_forming(weekly, 7 * 86400))}
+    d1, w1 = bot.trend_info(with_forming(closed, 86400)), bot.trend_info(with_forming(weekly, 7 * 86400))
+    return {"d1": d1["trend"], "w1": w1["trend"], "d1_age": d1["age"], "w1_age": w1["age"]}
 
 
 def group_of(sym):
@@ -114,7 +115,9 @@ def build_lines(api, symbols, now):
             print(f"[outlook/{sym}] pas de données D1, ignoré.")
             continue
         t = trends(sym, cs, now)
-        groups[group_of(sym)].append(f"{bot.display_name(sym)} : {LABEL[t['d1']]} (D1) / {LABEL[t['w1']]} (W1)")
+        tag = lambda tf, k: f"{tf} · {t[k + '_age']}" if OUTLOOK_SHOW_AGE and t[k + "_age"] else tf
+        groups[group_of(sym)].append(
+            f"{bot.display_name(sym)} : {LABEL[t['d1']]} ({tag('D1', 'd1')}) / {LABEL[t['w1']]} ({tag('W1', 'w1')})")
     return groups
 
 

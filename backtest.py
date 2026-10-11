@@ -7,7 +7,7 @@ puis suit chaque alerte avec tracker.py sur les bougies suivantes du timeframe d
 le timeframe de confirmation, donc moins de cas SL/TP dans la même bougie qu'en direct).
 
 Usage : python backtest.py [--strategy crt|impulse] [--days 30] [--symbols R_75,frxEURUSD] [--out fichier.csv]
-        [--trend-mode structure|swings|both]   (both : mêmes données rejouées avec les deux lectures de tendance)
+        [--trend-mode structure|deplacement|swings|all]   (all : mêmes données rejouées avec les trois lectures de tendance)
 Limites : 5000 bougies par requête Deriv, soit 45 jours maximum en M15 (CRT) et 16 jours en M5 (Impulsion).
 Pas de spread, de commission ni de glissement. Gain compté sur la cible de gain entière : TP2 pour le CRT,
 TP1 pour l'Impulsion (-1 pour un SL). Alignement 17h NY ignoré. Les ordres limites de l'Impulsion
@@ -139,9 +139,13 @@ def summary(strat, trades, days):
     ]
     if any(x["counter_trend"] for x in trades):   # sans objet pour l'Impulsion (toujours dans la tendance)
         sections.insert(2, ("Tendance", lambda x: "contre-tendance" if x["counter_trend"] else "dans la tendance"))
+    if any(x.get("trend_age") for x in trades):
+        sections.append(("Âge de la tendance", lambda x: x.get("trend_age") or "n/d"))
+    age_order = ["naissante", "établie", "mûre", "n/d"]
     for title, key in sections:
         L += ["", title]
-        for g in sorted({key(x) for x in trades}):
+        groups = {key(x) for x in trades}
+        for g in (sorted(groups, key=age_order.index) if title.startswith("Âge") else sorted(groups)):
             L.append("  " + group_line(g, [x for x in trades if key(x) == g], win))
     L += ["", "Meilleurs et pires symboles (résolus, 5 trades minimum)"]
     by_sym = {}
@@ -162,12 +166,12 @@ def write_csv(path, trades):
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["symbole", "reference", "confirmation", "sens", "ordre", "alerte_utc", "entree", "sl",
-                    "tp1", "tp2", "ratio_cible", "cible_de_gain", "tendance", "mode_tendance", "contre_tendance", "resultat", "tp1_atteint",
+                    "tp1", "tp2", "ratio_cible", "cible_de_gain", "tendance", "age_tendance", "mode_tendance", "contre_tendance", "resultat", "tp1_atteint",
                     "resolu_utc", "R"])
         for x in trades:
             w.writerow([x["symbol"], x["ref_tf"], x["confirmation_tf"], x["direction"], x["order_type"],
                         iso(x["alert_epoch"]), x["entry"], x["stop_loss"], x["tp1"], x["tp2"], x["risk_reward"],
-                        x["win_tp"].upper(), x.get("trend") or "", x.get("trend_mode", ""), int(x["counter_trend"]), x["result"], int(x["tp1_hit"]),
+                        x["win_tp"].upper(), x.get("trend") or "", x.get("trend_age") or "", x.get("trend_mode", ""), int(x["counter_trend"]), x["result"], int(x["tp1_hit"]),
                         iso(x.get("resolved_epoch")),
                         round(r_of(x), 2) if x["result"] in ("TP", "SL") else ""])
 
@@ -206,17 +210,17 @@ def run(api, strat, symbols, days, log=print):
 def compare(strat, by_mode):
     """Tableau comparatif des modes de tendance, sur le même historique."""
     L = ["COMPARAISON DES LECTURES DE TENDANCE (même historique)", ""]
-    L.append(f"{'mode':<11} {'setups':>6} {'résolus':>8} {'réussite':>9} {'R moyen':>8} {'somme R':>8}   contre-tendance")
+    L.append(f"{'mode':<12} {'setups':>6} {'résolus':>8} {'réussite':>9} {'R moyen':>8} {'somme R':>8}   contre-tendance")
     for m, trs in by_mode.items():
         res = [x for x in trs if x["result"] in ("TP", "SL")]
         wins = sum(1 for x in res if x["result"] == "TP")
         ct = [x for x in res if x["counter_trend"]]
         ct_txt = f"{len(ct)} trades, R moyen {sum(r_of(x) for x in ct) / len(ct):+.2f}" if ct else "aucun"
         if res:
-            L.append(f"{m:<11} {len(trs):>6} {len(res):>8} {100 * wins / len(res):>8.1f}% "
+            L.append(f"{m:<12} {len(trs):>6} {len(res):>8} {100 * wins / len(res):>8.1f}% "
                      f"{sum(r_of(x) for x in res) / len(res):>+8.2f} {sum(r_of(x) for x in res):>+8.1f}   {ct_txt}")
         else:
-            L.append(f"{m:<11} {len(trs):>6} {0:>8} {'-':>9} {'-':>8} {'-':>8}   {ct_txt}")
+            L.append(f"{m:<12} {len(trs):>6} {0:>8} {'-':>9} {'-':>8} {'-':>8}   {ct_txt}")
     if strat["label"] == "CRT":
         L += ["", "Pour le CRT, la tendance n'est qu'une étiquette : les setups sont les mêmes dans les deux modes,",
               "seule la colonne contre-tendance change. Pour l'Impulsion, la tendance est un filtre : le nombre",
@@ -230,8 +234,9 @@ def main():
     p.add_argument("--days", type=int, default=30, help="durée rejouée (45 jours maximum pour le CRT, 16 pour l'Impulsion)")
     p.add_argument("--symbols", default="", help="liste séparée par des virgules (défaut : tous les symboles de la stratégie)")
     p.add_argument("--out", default="", help="fichier CSV des trades (défaut : backtest_<stratégie>.csv)")
-    p.add_argument("--trend-mode", choices=["structure", "swings", "both"], default=bot.TREND_MODE,
-                   help="lecture de tendance : structure (précoce), swings (3 swings + SMA 50) ou both (comparaison)")
+    p.add_argument("--trend-mode", choices=list(bot.TREND_MODES) + ["all"], default=bot.TREND_MODE,
+                   help="lecture de tendance : structure (précoce), deplacement (structure + cassure impulsive), "
+                        "swings (3 swings + SMA 50) ou all (comparaison des trois)")
     a = p.parse_args()
     strat = STRATEGIES[a.strategy]
     days = max(1, min(a.days, strat["max_days"]))
@@ -244,7 +249,7 @@ def main():
     if bot.NY_ALIGNED and a.strategy == "crt":
         print("NY_ALIGNED ignoré : le backtest utilise les bougies natives de Deriv.")
     out = a.out or f"backtest_{a.strategy}.csv"
-    modes = ["structure", "swings"] if a.trend_mode == "both" else [a.trend_mode]
+    modes = list(bot.TREND_MODES) if a.trend_mode == "all" else [a.trend_mode]
     api = bot.Deriv()
     try:
         by_mode = run_modes(api, strat, symbols, days, modes)

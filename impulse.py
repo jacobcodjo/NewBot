@@ -6,7 +6,7 @@ Les calculs sont écrits pour un achat ; pour une vente, les bougies sont invers
 """
 import os, time
 import tracker
-from bot import (Deriv, get_candles, load, save, notify, body_avg, swings, detect_trend,
+from bot import (Deriv, get_candles, load, save, notify, body_avg, swings, detect_trend, trend_info,
                  display_name, fmt, code, decimals, ratio_txt, GRAN, CASCADES, CACHE_FILE)
 
 SYMBOLS = ["R_10", "R_25", "R_50", "R_75", "R_100",
@@ -257,7 +257,13 @@ def analyze(sym, get, now=None):
         ltf = None
         for d in ("BUY", "SELL"):
             H, M = (htf, mtf) if d == "BUY" else (flip(htf), flip(mtf))
-            if not trend_up(H):
+            age = None
+            if STRICT_TREND:
+                info = trend_info(H)   # règle choisie par TREND_MODE dans bot.py ; série retournée pour une vente
+                if info["trend"] != "bullish":
+                    continue
+                age = info["age"]      # naissante / établie / mûre (None en mode swings)
+            elif not trend_up(H):
                 continue
             imp = find_impulse(M)
             if not imp:
@@ -276,7 +282,7 @@ def analyze(sym, get, now=None):
                 "sym": sym, "dir": d, "ref_n": htf_n, "conf_n": ltf_n, "r": r, "dec": decimals(ltf),
                 "key": f"{sym}|{htf_n}>{mtf_n}>{ltf_n}|{d}|{imp['o_epoch']}|{imp['ext_epoch']}",
                 "counter": False, "win": "tp1", "max_age": PENDING_TTL,
-                "trend": "bullish" if d == "BUY" else "bearish",
+                "trend": "bullish" if d == "BUY" else "bearish", "trend_age": age,
                 "trade": {"otype": f"{d} LIMIT" if limit else d, "entry": r["entry"], "sl": r["sl"],
                           "tp1": r["tp1"], "tp2": r["tp2"], "tp3": r["tp3"], "rr": r["rr"]},
             })
