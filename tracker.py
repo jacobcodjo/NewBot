@@ -50,6 +50,7 @@ def new_trade(setup, alert_epoch):
         "max_age": setup.get("max_age", PENDING_MAX_AGE_DAYS * 86400),
         "counter_trend": bool(setup.get("counter")),
         "trend": setup.get("trend"), "trend_age": setup.get("trend_age"),
+        "zone": setup.get("zone"), "ote": t.get("ote"),
         "alert_epoch": alert_epoch,
         "filled": market, "fill_epoch": alert_epoch if market else None,
         "tp1_hit": False,
@@ -130,6 +131,7 @@ def _archive(stats, trade, result, when):
         "order_type": trade["order_type"], "counter_trend": trade["counter_trend"],
         "risk_reward": trade["risk_reward"], "tp1_hit": trade["tp1_hit"],
         "win_tp": trade.get("win_tp", "tp2"),
+        "zone": trade.get("zone"), "ote": trade.get("ote"),
         "result": result, "alert_epoch": trade["alert_epoch"], "resolved_epoch": when,
     })
 
@@ -221,6 +223,13 @@ def summarize(stats, name="CRT", win="tp2"):
             r = _rate([h for h in resolved if asset_class(h["symbol"]) == cls])
             if r:
                 parts.append(f"{cls} : {r[0]}% sur {r[1]}")
+        for zone in sorted({h.get("zone") for h in resolved if h.get("zone")}):   # Impulsion : Golden Zone / OTE
+            r = _rate([h for h in resolved if h.get("zone") == zone])
+            parts.append(f"Zone {zone} : {r[0]}% sur {r[1]}")
+        for label, val in (("dans l'OTE", True), ("hors OTE", False)):                # CRT : entrée dans l'OTE ou non
+            r = _rate([h for h in resolved if h.get("ote") is val])
+            if r and any(h.get("ote") is not None and h["ote"] is not val for h in resolved):
+                parts.append(f"Entrée {label} : {r[0]}% sur {r[1]}")
         for ref in sorted({h.get("ref_tf") for h in resolved if h.get("ref_tf")}):
             r = _rate([h for h in resolved if h.get("ref_tf") == ref])
             parts.append(f"Référence {ref} : {r[0]}% sur {r[1]}")

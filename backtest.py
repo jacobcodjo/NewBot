@@ -139,6 +139,10 @@ def summary(strat, trades, days):
     ]
     if any(x["counter_trend"] for x in trades):   # sans objet pour l'Impulsion (toujours dans la tendance)
         sections.insert(2, ("Tendance", lambda x: "contre-tendance" if x["counter_trend"] else "dans la tendance"))
+    if any(x.get("zone") for x in trades):    # Impulsion
+        sections.append(("Zone de retracement", lambda x: x.get("zone") or "n/d"))
+    if any(x.get("ote") is not None for x in trades):    # CRT
+        sections.append(("Entrée dans l'OTE (61,8-79 %)", lambda x: "oui" if x.get("ote") else "non"))
     if any(x.get("trend_age") for x in trades):
         sections.append(("Âge de la tendance", lambda x: x.get("trend_age") or "n/d"))
     age_order = ["naissante", "établie", "mûre", "n/d"]
@@ -166,12 +170,13 @@ def write_csv(path, trades):
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["symbole", "reference", "confirmation", "sens", "ordre", "alerte_utc", "entree", "sl",
-                    "tp1", "tp2", "ratio_cible", "cible_de_gain", "tendance", "age_tendance", "mode_tendance", "contre_tendance", "resultat", "tp1_atteint",
+                    "tp1", "tp2", "ratio_cible", "cible_de_gain", "tendance", "age_tendance", "zone", "ote", "mode_tendance", "contre_tendance", "resultat", "tp1_atteint",
                     "resolu_utc", "R"])
         for x in trades:
             w.writerow([x["symbol"], x["ref_tf"], x["confirmation_tf"], x["direction"], x["order_type"],
                         iso(x["alert_epoch"]), x["entry"], x["stop_loss"], x["tp1"], x["tp2"], x["risk_reward"],
-                        x["win_tp"].upper(), x.get("trend") or "", x.get("trend_age") or "", x.get("trend_mode", ""), int(x["counter_trend"]), x["result"], int(x["tp1_hit"]),
+                        x["win_tp"].upper(), x.get("trend") or "", x.get("trend_age") or "", x.get("zone") or "",
+                        "" if x.get("ote") is None else int(bool(x["ote"])), x.get("trend_mode", ""), int(x["counter_trend"]), x["result"], int(x["tp1_hit"]),
                         iso(x.get("resolved_epoch")),
                         round(r_of(x), 2) if x["result"] in ("TP", "SL") else ""])
 

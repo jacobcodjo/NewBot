@@ -283,6 +283,7 @@ def analyze(sym, get, now=None):
                 "key": f"{sym}|{htf_n}>{mtf_n}>{ltf_n}|{d}|{imp['o_epoch']}|{imp['ext_epoch']}",
                 "counter": False, "win": "tp1", "max_age": PENDING_TTL,
                 "trend": "bullish" if d == "BUY" else "bearish", "trend_age": age,
+                "zone": r["label"],   # "Golden Zone" (50-61,8 %) ou "OTE" (61,8-79 %)
                 "trade": {"otype": f"{d} LIMIT" if limit else d, "entry": r["entry"], "sl": r["sl"],
                           "tp1": r["tp1"], "tp2": r["tp2"], "tp3": r["tp3"], "rr": r["rr"]},
             })
