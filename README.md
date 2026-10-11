@@ -64,7 +64,7 @@ Stratégie et liste d'actifs reprises de l'ancien Crt-Bot. Le client Deriv, le c
 4. Une seule alerte par range de référence et par timeframe de confirmation : le premier setup confirmé verrouille le range jusqu'à la bougie de référence suivante. Un second contrôle sur le contenu (symbole, sens, entrée, SL, TP2) évite deux messages identiques. Les verrous sont purgés après 30 jours (`STATE_MAX_AGE_DAYS`).
 
 **Filtres et indications**
-- **Tendance de fond (D1) :** 3 sommets et 3 creux consécutifs dans le même sens, confirmés par la SMA 50 (`TREND_SWING_WINDOW`, `TREND_SWING_COUNT`, `TREND_SMA_PERIOD`). Un setup à contre-tendance n'est jamais bloqué : la ligne « ⚠️ Contre-tendance (D1) » est ajoutée.
+- **Tendance de fond (D1) :** un setup à contre-tendance n'est jamais bloqué : la ligne « ⚠️ Contre-tendance (D1) » est ajoutée. La lecture de tendance est commune au CRT, à l'Impulsion et au récapitulatif hebdomadaire (voir « Lecture de la tendance » plus bas).
 - **Killzones (heure de New York) :** Londres 3h-6h et New York 8h30-11h30, uniquement pour le forex et l'or. Les cryptos et les indices synthétiques (24/7) ne sont pas filtrés. Par défaut, c'est une indication : la ligne « Session » affiche le nom de la killzone du sweep, ou « hors killzone ». `REQUIRE_KILLZONE_FOR_REAL_MARKETS = True` ignore les sweeps hors killzone, et `KILLZONE_24_7 = True` applique aussi le filtre aux cryptos et indices synthétiques.
 - **Filtre de gap de weekend (forex et or) :** une bougie qui suit un écart de temps anormal n'est jamais comptée comme un sweep (`WEEKEND_GAP_MULTIPLIER`).
 - **Pools de liquidité (equal highs / equal lows) :** si le sweep a balayé un pool détecté, la ligne « 💧 Pool de liquidité balayé » est ajoutée. Si le stop-loss tombe lui-même sur un pool du même côté (creux égaux sous un achat, sommets égaux au-dessus d'une vente), il est écarté d'une marge supplémentaire (`STOP_LOSS_POOL_BUFFER_PCT`). Réglages : `LIQUIDITY_POOL_SWING_WINDOW` et `LIQUIDITY_POOL_TOLERANCE_PCT`.
@@ -94,8 +94,9 @@ Chaque alerte est enregistrée dans un fichier de statistiques par stratégie : 
 
 Le script rejoue l'historique Deriv comme le bot l'aurait vu : à chaque clôture de bougie du timeframe de pas (M15 pour le CRT, M5 pour l'Impulsion), il reconstruit les bougies visibles, applique la stratégie, les mêmes verrous anti-doublon et le même suivi. Chaque alerte est ensuite suivie sur les bougies suivantes du timeframe de pas (plus fines que le suivi en direct, donc moins de cas SL et cible dans la même bougie).
 
-- **Sur GitHub :** Actions → CRT Backtest → Run workflow, avec la stratégie (`crt` ou `impulse`), la durée en jours et, si besoin, des symboles séparés par des virgules (par exemple `R_75,frxEURUSD` pour le CRT, `R_75,1HZ100V` pour l'Impulsion). Le résumé s'affiche dans la page de l'exécution et le fichier `backtest_crt.csv` ou `backtest_impulse.csv` est téléchargeable dans les artefacts. Le backtest complet des 47 actifs du CRT prend plusieurs minutes.
-- **En local :** `python backtest.py --strategy impulse --days 14 --symbols R_75,1HZ100V`
+- **Sur GitHub :** Actions → CRT Backtest → Run workflow, avec la stratégie (`crt` ou `impulse`), la durée en jours et, si besoin, des symboles séparés par des virgules (par exemple `R_75,frxEURUSD` pour le CRT, `R_75,1HZ100V` pour l'Impulsion). Le résumé s'affiche dans la page de l'exécution et le fichier `backtest_crt.csv` ou `backtest_impulse.csv` (avec les colonnes `tendance` et `mode_tendance`) est téléchargeable dans les artefacts. Le backtest complet des 47 actifs du CRT prend plusieurs minutes.
+- **Lecture de tendance :** `--trend-mode structure` (défaut), `swings`, ou `both`, qui rejoue le même historique avec les deux règles et affiche un tableau comparatif (setups, réussite, R moyen, contre-tendance). Pour le CRT, la tendance n'est qu'une étiquette : seuls les résultats « contre-tendance » changent. Pour l'Impulsion, c'est un filtre : le nombre de setups change. Sur GitHub, c'est le champ « trend_mode » du workflow.
+- **En local :** `python backtest.py --strategy impulse --days 14 --symbols R_75,1HZ100V --trend-mode both`
 - **Résultat :** réussite et R moyen (SL = -1, gain = ratio de la cible : TP2 pour le CRT, TP1 pour l'Impulsion), plus TP1 atteint pour le CRT, globalement puis par classe d'actif, référence, tendance (CRT), type d'ordre et sens, plus les meilleurs et pires symboles (5 trades minimum).
 - **Limites :** 5000 bougies par requête Deriv, soit 45 jours au maximum pour le CRT (M15) et 16 jours pour l'Impulsion (M5) : une durée plus longue est ramenée à ce maximum. Pas de spread, de commission ni de glissement. Les bougies D1 et H4 sont celles de Deriv (`NY_ALIGNED` est ignoré). Les marchés fermés suivent la même règle qu'en direct. Un backtest sur quelques semaines n'est pas statistiquement concluant et ne garantit rien pour la suite.
 
@@ -104,7 +105,7 @@ Le script rejoue l'historique Deriv comme le bot l'aurait vu : à chaque clôtur
 **Actifs :** Volatility 10, 25, 50, 75, 100 et leurs variantes 1s. **Cascade (HTF → MTF → LTF) :** D1→H4→H1, H4→H1→M15, H1→M15→M5 (`CASCADES` dans `bot.py`, utilisée uniquement par l'Impulsion).
 
 **Règles (écrites pour un achat, la vente est le miroir)**
-1. Tendance (HTF) : 3 sommets et 3 creux consécutifs de plus en plus hauts, avec un prix au-dessus de la SMA 50 (même lecture que le tag contre-tendance du CRT et le récapitulatif hebdomadaire, reprise de pa-bot). Sinon, pas de signal. `STRICT_TREND = False` rétablit l'ancienne règle, plus souple : les 2 derniers sommets et creux plus hauts. Deux pivots consécutifs au même prix comptent pour un seul swing.
+1. Tendance (HTF) : haussière selon `bot.detect_trend` (voir « Lecture de la tendance » : structure de marché précoce par défaut, ou 3 swings + SMA 50 avec `TREND_MODE = swings`). Sinon, pas de signal. `STRICT_TREND = False` rétablit l'ancienne règle, encore plus souple : les 2 derniers sommets et creux plus hauts, sans cassure ni SMA.
 2. Impulsion (MTF) : cassure de structure avec déplacement, sur une jambe d'au moins 2 ATR. Le Fibonacci va de l'origine (creux) à l'extrême (plus haut, mèche comprise). Le setup est annulé si une bougie MTF clôture au-delà de 79 % ou si l'origine est reprise.
 3. Zone acceptée : de 50 % à 79 % de la jambe, mesurés à partir de l'extrême.
 4. Entrée (LTF) : le prix touche la zone, balaie un creux LTF formé pendant le retracement (mèche sous le creux, clôture au-dessus), puis casse la structure avec déplacement en laissant un FVG. L'OB est la dernière bougie baissière avant ce déplacement. Il doit chevaucher la zone.
@@ -123,9 +124,22 @@ Le script rejoue l'historique Deriv comme le bot l'aurait vu : à chaque clôtur
 
 **Suivi et backtest :** chaque alerte est suivie dans `trade_stats_impulse.json` (voir plus haut). Le gain est compté sur TP1, la cible du ratio de 1 pour 3. Le message de test affiche le résumé, et `python backtest.py --strategy impulse` rejoue la stratégie sur l'historique Deriv.
 
+## Lecture de la tendance (`bot.detect_trend`)
+
+Une seule fonction lit la tendance de fond, pour le tag contre-tendance du CRT (D1), le filtre de tendance de l'Impulsion (timeframe de référence) et le récapitulatif hebdomadaire (D1 et W1). Elle renvoie `bullish`, `bearish`, `range` (ou rien si l'historique est trop court). Deux règles, choisies par `TREND_MODE` dans `bot.py` :
+
+- **`structure` (défaut, précoce).** Pivots confirmés 3 bougies après leur formation (`TREND_STRUCTURE_WINDOW`). La tendance est haussière si les deux derniers creux montent, si les deux derniers sommets montent **ou** si le dernier cours clôture au-dessus du dernier sommet (cassure de structure), et si le cours reste au-dessus du dernier creux. Baissière : le miroir. Elle demande 2 sommets et 2 creux au lieu de 3 et 3, sans SMA, et elle s'arrête dès que le dernier creux (ou sommet) est cassé.
+- **`swings` (ancienne règle, tardive).** 3 sommets et 3 creux consécutifs dans le même sens, fenêtre de 4 bougies, prix du bon côté de la SMA 50.
+
+Deux pivots consécutifs au même prix comptent pour un seul swing dans les deux règles.
+
+**Ce que ça change, mesuré sur des données fictives :** sur un retournement construit à la main, le mode `structure` signale la nouvelle tendance 20 bougies après le creux, contre 44 pour `swings`. En fin de tendance, il ne sort pas plus tôt (14 bougies après le sommet, contre 12). Le prix à payer est le bruit : sur un marché aléatoire sans dérive, `structure` annonce une tendance 62 % du temps et change de sens environ 43 fois par série de 1400 bougies, contre 23 % et environ 9 fois pour `swings`. Il filtre donc beaucoup moins : c'est surtout vrai pour les Volatility Index, qui sont des marchés simulés. Compare les deux règles sur l'historique réel avec `python backtest.py --trend-mode both` avant de te fier à l'une ou à l'autre.
+
+**Changer de règle sans modifier le code :** crée une variable de dépôt `TREND_MODE` (Settings → Secrets and variables → Actions → Variables) avec la valeur `swings` ou `structure`. Sans variable, c'est `structure`.
+
 ## Récapitulatif hebdomadaire (`outlook.py`)
 
-Repris de pa-bot. Une fois par week-end, le bot envoie le biais directionnel de fond (D1 et W1) de chaque actif. Ce n'est pas une stratégie : c'est la même lecture de tendance que le tag contre-tendance du CRT (3 sommets et 3 creux consécutifs, confirmés par la SMA 50), sans niveaux d'entrée ni de sortie. C'est un repère pour préparer la semaine.
+Repris de pa-bot. Une fois par week-end, le bot envoie le biais directionnel de fond (D1 et W1) de chaque actif. Ce n'est pas une stratégie : c'est la même lecture de tendance que le tag contre-tendance du CRT (`bot.detect_trend`, voir « Lecture de la tendance »), sans niveaux d'entrée ni de sortie. C'est un repère pour préparer la semaine.
 
 ```
 📅 Outlook de la semaine — 09:00 (UTC+1)
@@ -181,7 +195,9 @@ Chaque TP affiche son ratio gain/risque, calculé depuis l'entrée prévue (le f
 | `bot.py` | `SYMBOLS` | Liste des actifs du CRT (47) |
 | `bot.py` | `REFERENCE_CONFIRMATION_MAP` | Référence (W1, D1, H4) et timeframe de confirmation associé |
 | `bot.py` | `STRUCTURE_SWING_WINDOW`, `DEFAULT_STRUCTURE_SWING_WINDOW` | Fenêtre des swings de la cassure de structure, par timeframe de confirmation |
-| `bot.py` | `TREND_SWING_WINDOW`, `TREND_SWING_COUNT`, `TREND_SMA_PERIOD` | Détection de la tendance de fond D1 (tag contre-tendance) |
+| `bot.py` | `TREND_SWING_WINDOW`, `TREND_SWING_COUNT`, `TREND_SMA_PERIOD` | Mode `swings` : fenêtre, nombre de swings et SMA de la tendance |
+| `bot.py` | `TREND_MODE` | Lecture de tendance : `structure` (précoce, défaut) ou `swings` (3 swings + SMA 50) ; peut être imposé par la variable de dépôt `TREND_MODE` |
+| `bot.py` | `TREND_STRUCTURE_WINDOW` | Mode structure : bougies de confirmation d'un pivot |
 | `bot.py` | `KILLZONES_NY` | Noms et horaires des sessions (heure de New York) |
 | `bot.py` | `REQUIRE_KILLZONE_FOR_REAL_MARKETS` | `True` ignore les sweeps hors killzone (forex et or) |
 | `bot.py` | `KILLZONE_24_7` | `True` pour filtrer aussi cryptos et indices synthétiques |

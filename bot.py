@@ -54,9 +54,14 @@ REFERENCE_CONFIRMATION_MAP = {"W1": ["H4"], "D1": ["H1"], "H4": ["M15"]}
 # Fenêtre des swings pour la cassure de structure, par TF de confirmation
 STRUCTURE_SWING_WINDOW = {"M15": 1}
 DEFAULT_STRUCTURE_SWING_WINDOW = 2
-TREND_SWING_WINDOW = 4             # tendance de fond D1 : fenêtre des swings
-TREND_SWING_COUNT = 3              # 3 sommets ET 3 creux consécutifs dans le même sens
-TREND_SMA_PERIOD = 50              # confirmée par la position du prix vs SMA 50 (D1)
+# Tendance de fond (D1 pour le CRT, HTF pour l'Impulsion, D1 et W1 pour le récapitulatif)
+TREND_MODE = os.getenv("TREND_MODE", "structure")   # "structure" (précoce) ou "swings" (ancienne règle, plus tardive)
+if TREND_MODE not in ("structure", "swings"):
+    TREND_MODE = "structure"
+TREND_STRUCTURE_WINDOW = 3         # mode structure : un swing est confirmé 3 bougies après (4 pour l'ancien mode)
+TREND_SWING_WINDOW = 4             # mode swings : fenêtre des swings
+TREND_SWING_COUNT = 3              # mode swings : 3 sommets ET 3 creux consécutifs dans le même sens
+TREND_SMA_PERIOD = 50              # mode swings : confirmée par la position du prix vs SMA 50
 WEEKEND_GAP_PREFIXES = ("frx",)    # forex + or : bougie après un gap de weekend = pas un sweep
 WEEKEND_GAP_MULTIPLIER = 1.5
 LIQUIDITY_POOL_SWING_WINDOW = 3    # pools de liquidité (equal highs / equal lows)
@@ -407,15 +412,46 @@ def detect_order_block(cs, around, d, window=5):
     return None
 
 
-def detect_trend(cs):
-    """Tendance de fond (D1) : 3 sommets ET 3 creux consécutifs dans le même sens + SMA."""
+def trend_pivots(closed, w):
+    """Pivots confirmés ; deux pivots consécutifs au même prix forment un seul swing (sommet ou creux plat)."""
+    hi, lo = find_pivots(closed, w, w)
+    hi = [i for n, i in enumerate(hi) if n == 0 or closed[i]["high"] != closed[hi[n - 1]]["high"]]
+    lo = [i for n, i in enumerate(lo) if n == 0 or closed[i]["low"] != closed[lo[n - 1]]["low"]]
+    return hi, lo
+
+
+def detect_trend_structure(cs):
+    """Tendance par structure de marché (précoce). Haussière si, sur les pivots confirmés :
+    - les deux derniers creux montent (higher low) ;
+    - ET soit les deux derniers sommets montent (higher high), soit le dernier cours clôture
+      au-dessus du dernier sommet (cassure de structure : le début de tendance compte, pas besoin
+      d'attendre un second sommet plus haut) ;
+    - ET le dernier cours reste au-dessus du dernier creux (sinon la structure est cassée : la
+      tendance est déclarée finie dès la cassure, sans attendre un swing de plus).
+    Baissière : miroir. Sinon « range ». Il suffit de 2 sommets et 2 creux, au lieu de 3 et 3 + SMA 50."""
+    closed = cs[:-1] if len(cs) > 1 else cs
+    w = TREND_STRUCTURE_WINDOW
+    if len(closed) < 4 * w:
+        return None
+    hi, lo = trend_pivots(closed, w)
+    if len(hi) < 2 or len(lo) < 2:
+        return None
+    h1, h2 = closed[hi[-1]]["high"], closed[hi[-2]]["high"]
+    l1, l2 = closed[lo[-1]]["low"], closed[lo[-2]]["low"]
+    px = closed[-1]["close"]
+    if l1 > l2 and (h1 > h2 or px > h1) and px > l1:
+        return "bullish"
+    if h1 < h2 and (l1 < l2 or px < l1) and px < h1:
+        return "bearish"
+    return "range"
+
+
+def detect_trend_swings(cs):
+    """Ancienne règle (plus tardive) : 3 sommets ET 3 creux consécutifs dans le même sens + SMA 50."""
     closed = cs[:-1] if len(cs) > 1 else cs
     if len(closed) < TREND_SMA_PERIOD:
         return None
-    hi, lo = find_pivots(closed, TREND_SWING_WINDOW, TREND_SWING_WINDOW)
-    # deux pivots consécutifs au même prix forment un seul swing (sommet ou creux plat)
-    hi = [i for n, i in enumerate(hi) if n == 0 or closed[i]["high"] != closed[hi[n - 1]]["high"]]
-    lo = [i for n, i in enumerate(lo) if n == 0 or closed[i]["low"] != closed[lo[n - 1]]["low"]]
+    hi, lo = trend_pivots(closed, TREND_SWING_WINDOW)
     if len(hi) < TREND_SWING_COUNT or len(lo) < TREND_SWING_COUNT:
         return None
     h = [closed[i]["high"] for i in hi[-TREND_SWING_COUNT:]]
@@ -428,6 +464,12 @@ def detect_trend(cs):
     if down and closed[-1]["close"] < sma:
         return "bearish"
     return "range"
+
+
+def detect_trend(cs):
+    """Tendance de fond : 'bullish', 'bearish', 'range' ou None (historique insuffisant).
+    La dernière bougie (en formation) est ignorée. Règle choisie par TREND_MODE."""
+    return detect_trend_structure(cs) if TREND_MODE == "structure" else detect_trend_swings(cs)
 
 
 def is_stale(d, j, t, cs):
@@ -493,6 +535,7 @@ def analyze(sym, htf, ltf_by_tf):
                     "price": price, "session": session,
                     "grabbed": near_level(ext, swept_pools),
                     "counter": (trend == "bullish" and d == "SELL") or (trend == "bearish" and d == "BUY"),
+                    "trend": trend,
                 })
     return setups
 

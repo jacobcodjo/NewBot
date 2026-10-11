@@ -49,6 +49,7 @@ def new_trade(setup, alert_epoch):
         "win_tp": setup.get("win", "tp2"),
         "max_age": setup.get("max_age", PENDING_MAX_AGE_DAYS * 86400),
         "counter_trend": bool(setup.get("counter")),
+        "trend": setup.get("trend"),
         "alert_epoch": alert_epoch,
         "filled": market, "fill_epoch": alert_epoch if market else None,
         "tp1_hit": False,

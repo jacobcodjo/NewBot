@@ -30,8 +30,8 @@ LATE_CANDLES = 2            # entrée tardive : le prix a quitté l'OB depuis 2 
 LATE_DIST = 0.5             # ... et se trouve à moins d'une demi-hauteur d'OB de son bord
 LATE_PROGRESS = 0.25        # ... et a fait moins de 25 % du chemin bord de l'OB -> TP1
 PENDING_TTL = 24 * 3600     # un ordre limite en attente expire après 24 h
-STRICT_TREND = True         # True : 3 sommets et 3 creux consécutifs + SMA 50 (filtre de pa-bot) ;
-                            # False : ancienne règle, 2 derniers sommets et creux plus hauts
+STRICT_TREND = True         # True : lecture de tendance de bot.detect_trend (règle choisie par TREND_MODE dans bot.py,
+                            # par défaut la structure de marché précoce) ; False : ancienne règle, 2 derniers sommets et creux plus hauts
 
 
 def flip(cs):
@@ -51,12 +51,11 @@ def body(c):
 
 
 # --------------------------------------------------------------------------
-# 1) Tendance HTF : sommets et creux de plus en plus hauts (3 swings + SMA 50 si STRICT_TREND)
+# 1) Tendance HTF : structure haussière (règle de bot.detect_trend si STRICT_TREND)
 # --------------------------------------------------------------------------
 def trend_up(htf):
     if STRICT_TREND:
-        # même lecture de tendance que le CRT et le récapitulatif hebdomadaire (bot.detect_trend) :
-        # 3 sommets ET 3 creux consécutifs plus hauts, prix au-dessus de la SMA 50 (série retournée pour une vente)
+        # même lecture de tendance que le CRT et le récapitulatif hebdomadaire (bot.detect_trend ; série retournée pour une vente)
         return detect_trend(htf) == "bullish"
     h = htf[:-1]
     if len(h) < 12:
@@ -277,6 +276,7 @@ def analyze(sym, get, now=None):
                 "sym": sym, "dir": d, "ref_n": htf_n, "conf_n": ltf_n, "r": r, "dec": decimals(ltf),
                 "key": f"{sym}|{htf_n}>{mtf_n}>{ltf_n}|{d}|{imp['o_epoch']}|{imp['ext_epoch']}",
                 "counter": False, "win": "tp1", "max_age": PENDING_TTL,
+                "trend": "bullish" if d == "BUY" else "bearish",
                 "trade": {"otype": f"{d} LIMIT" if limit else d, "entry": r["entry"], "sl": r["sl"],
                           "tp1": r["tp1"], "tp2": r["tp2"], "tp3": r["tp3"], "rr": r["rr"]},
             })
