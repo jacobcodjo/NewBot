@@ -13,6 +13,8 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      TREND_MODE: ${{ vars.TREND_MODE }}   # variable de dépôt facultative : structure (défaut), deplacement ou swings
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
