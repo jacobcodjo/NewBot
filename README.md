@@ -4,8 +4,8 @@ Deux scripts Python qui analysent les bougies de l'API Deriv et envoient des ale
 
 | Fichier | Rôle |
 |---|---|
-| `bot.py` | Stratégie CRT (Candle Range Trading) sur 47 actifs, plus le client Deriv, les notifications et les fonctions partagées avec `impulse.py` |
-| `impulse.py` | Stratégie Impulsion + retracement Fibonacci sur 10 Volatility Index |
+| `bot.py` | Stratégie CRT (Candle Range Trading) sur 29 actifs (forex, or, cryptos), plus le client Deriv, les notifications et les fonctions partagées avec `impulse.py` |
+| `impulse.py` | Stratégie Impulsion + retracement Fibonacci sur les 18 indices synthétiques |
 | `outlook.py` | Récapitulatif hebdomadaire du biais D1/W1 (repris de pa-bot) |
 | `bias_study.py` | Étude de prédictibilité : la clôture D1 ou W1 prédit-elle la direction de la bougie suivante ? |
 | `tracker.py` | Suivi automatique des trades du CRT (`trade_stats.json`) et de l'Impulsion (`trade_stats_impulse.json`) |
@@ -49,7 +49,9 @@ Attention : 288 exécutions par jour dépassent le quota gratuit des dépôts pr
 
 Stratégie et liste d'actifs reprises de l'ancien Crt-Bot. Le client Deriv, le cache, les notifications, les entrées/sorties et les alertes du second bot restent ceux de ce dépôt.
 
-**Actifs (47) :** forex majeurs (EURUSD, GBPUSD, USDJPY, USDCHF, AUDUSD, USDCAD) et mineurs (paires croisées sans USD : EUR, GBP, AUD, CAD, CHF, NZD), l'or (XAUUSD), BTC, ETH, LTC, XRP, les Volatility Index classiques (10, 25, 50, 75, 100) et toutes les variantes 1 seconde (10, 15, 25, 30, 50, 75, 90, 100, 150, 200, 250, 300), et le Step Index. La liste est `SYMBOLS` dans `bot.py`.
+**Répartition par classe d'actifs :** le CRT couvre le forex, l'or et les cryptos ; l'Impulsion couvre les indices synthétiques. Aucun actif n'est scanné par les deux stratégies.
+
+**Actifs du CRT (29) :** forex majeurs (EURUSD, GBPUSD, USDJPY, USDCHF, AUDUSD, USDCAD) et mineurs (paires croisées sans USD : EUR, GBP, AUD, CAD, CHF, NZD), l'or (XAUUSD), BTC, ETH, LTC et XRP. La liste est `SYMBOLS` dans `bot.py`. Les indices synthétiques sont dans `SYNTHETIC_SYMBOLS` (même fichier), scannés par `impulse.py`. Pour remettre un indice synthétique dans le CRT, ajoute-le à `SYMBOLS`.
 
 **Principe**
 1. Range de référence : haut/bas de la dernière période **W1** (semaine ISO complète, dérivée des bougies D1), **D1** ou **H4** clôturée.
@@ -67,14 +69,14 @@ Stratégie et liste d'actifs reprises de l'ancien Crt-Bot. Le client Deriv, le c
 
 **Filtres et indications**
 - **Tendance de fond (D1) :** un setup à contre-tendance n'est jamais bloqué : la ligne « ⚠️ Contre-tendance (D1) » est ajoutée. La lecture de tendance est commune au CRT, à l'Impulsion et au récapitulatif hebdomadaire (voir « Lecture de la tendance » plus bas).
-- **Killzones (heure de New York) :** Londres 3h-6h et New York 8h30-11h30, uniquement pour le forex et l'or. Les cryptos et les indices synthétiques (24/7) ne sont pas filtrés. Par défaut, c'est une indication : la ligne « Session » affiche le nom de la killzone du sweep, ou « hors killzone ». `REQUIRE_KILLZONE_FOR_REAL_MARKETS = True` ignore les sweeps hors killzone, et `KILLZONE_24_7 = True` applique aussi le filtre aux cryptos et indices synthétiques.
+- **Killzones (heure de New York) :** Londres 3h-6h et New York 8h30-11h30, uniquement pour le forex et l'or. Les cryptos (24/7) ne sont pas filtrées. Par défaut, c'est une indication : la ligne « Session » affiche le nom de la killzone du sweep, ou « hors killzone ». `REQUIRE_KILLZONE_FOR_REAL_MARKETS = True` ignore les sweeps hors killzone, et `KILLZONE_24_7 = True` applique aussi le filtre aux cryptos et indices synthétiques.
 - **Filtre de gap de weekend (forex et or) :** une bougie qui suit un écart de temps anormal n'est jamais comptée comme un sweep (`WEEKEND_GAP_MULTIPLIER`).
 - **Pools de liquidité (equal highs / equal lows) :** si le sweep a balayé un pool détecté, la ligne « 💧 Pool de liquidité balayé » est ajoutée. Si le stop-loss tombe lui-même sur un pool du même côté (creux égaux sous un achat, sommets égaux au-dessus d'une vente), il est écarté d'une marge supplémentaire (`STOP_LOSS_POOL_BUFFER_PCT`). Réglages : `LIQUIDITY_POOL_SWING_WINDOW` et `LIQUIDITY_POOL_TOLERANCE_PCT`.
 - **D1 et H4 :** bougies natives de Deriv. `NY_ALIGNED = True` recalcule D1 et H4 depuis le H1 avec une ouverture à 17h New York (forex et or).
 
 **Entrées et sorties**
 - **Entrée, marchés réels (forex, or, cryptos) :** au niveau de la cassure de structure, par ordre de priorité : Order Block (dernière bougie opposée avant le mouvement, à 8 bougies au plus de la cassure), sinon Breaker Block, sinon milieu du FVG. Pour l'OB et le Breaker, le niveau est le bord que le prix atteint en premier (le haut pour un achat, le bas pour une vente). Si aucun des trois n'existe, le setup est ignoré.
-- **Entrée, indices synthétiques :** immédiate, à la clôture de la bougie de cassure de structure. Ces actifs enchaînent souvent des mouvements directs sans revenir sur la zone, où un ordre en attente resterait non rempli.
+- **Entrée, indices synthétiques (inactive tant qu'aucun n'est dans `SYMBOLS`) :** immédiate, à la clôture de la bougie de cassure de structure. Ces actifs enchaînent souvent des mouvements directs sans revenir sur la zone, où un ordre en attente resterait non rempli.
 - **Stop-loss :** au-delà de l'extrême de la bougie de sweep, avec une marge de 0,05 % du prix (`STOP_LOSS_BUFFER_PCT`).
 - **Cibles (tous les actifs) :** TP1 à mi-range (50 %), TP2 au bord opposé du range de référence, TP3 au bord opposé plus 50 % de la taille du range (`TP_EXTENSION_PCT`).
 - **Ratio :** calculé sur TP2. Une alerte n'est envoyée que si le ratio est d'au moins 1 pour 3 (`MIN_RISK_REWARD`).
@@ -96,7 +98,7 @@ Chaque alerte est enregistrée dans un fichier de statistiques par stratégie : 
 
 Le script rejoue l'historique Deriv comme le bot l'aurait vu : à chaque clôture de bougie du timeframe de pas (M15 pour le CRT, M5 pour l'Impulsion), il reconstruit les bougies visibles, applique la stratégie, les mêmes verrous anti-doublon et le même suivi. Chaque alerte est ensuite suivie sur les bougies suivantes du timeframe de pas (plus fines que le suivi en direct, donc moins de cas SL et cible dans la même bougie).
 
-- **Sur GitHub :** Actions → CRT Backtest → Run workflow, avec la stratégie (`crt` ou `impulse`), la durée en jours et, si besoin, des symboles séparés par des virgules (par exemple `R_75,frxEURUSD` pour le CRT, `R_75,1HZ100V` pour l'Impulsion). Le résumé s'affiche dans la page de l'exécution et le fichier `backtest_crt.csv` ou `backtest_impulse.csv` (avec les colonnes `tendance`, `age_tendance`, `zone`, `ote` et `mode_tendance`) est téléchargeable dans les artefacts. Le backtest complet des 47 actifs du CRT prend plusieurs minutes.
+- **Sur GitHub :** Actions → CRT Backtest → Run workflow, avec la stratégie (`crt` ou `impulse`), la durée en jours et, si besoin, des symboles séparés par des virgules (par exemple `frxEURUSD,cryBTCUSD` pour le CRT, `R_75,1HZ100V` pour l'Impulsion ; un symbole d'une autre stratégie est refusé). Le résumé s'affiche dans la page de l'exécution et le fichier `backtest_crt.csv` ou `backtest_impulse.csv` (avec les colonnes `tendance`, `age_tendance`, `zone`, `ote` et `mode_tendance`) est téléchargeable dans les artefacts. Le backtest complet des 29 actifs du CRT prend quelques minutes, celui des 18 indices de l'Impulsion davantage (pas de 5 minutes).
 - **Lecture de tendance :** `--trend-mode structure` (défaut), `deplacement`, `swings`, ou `all`, qui rejoue le même historique avec les trois règles et affiche un tableau comparatif (setups, réussite, R moyen, contre-tendance). Le résumé de chaque mode contient un tableau par âge de tendance, et selon la stratégie un tableau par zone de retracement (Impulsion : Golden Zone 50-61,8 % contre OTE 61,8-79 %) ou selon que l'entrée tombe dans l'OTE ou non (CRT). Pour le CRT, la tendance n'est qu'une étiquette : seuls les résultats « contre-tendance » changent. Pour l'Impulsion, c'est un filtre : le nombre de setups change. Sur GitHub, c'est le champ « trend_mode » du workflow.
 - **En local :** `python backtest.py --strategy impulse --days 14 --symbols R_75,1HZ100V --trend-mode all`
 - **Résultat :** réussite et R moyen (SL = -1, gain = ratio de la cible : TP2 pour le CRT, TP1 pour l'Impulsion), plus TP1 atteint pour le CRT, globalement puis par classe d'actif, référence, tendance (CRT), type d'ordre et sens, plus les meilleurs et pires symboles (5 trades minimum).
@@ -104,7 +106,7 @@ Le script rejoue l'historique Deriv comme le bot l'aurait vu : à chaque clôtur
 
 ## Stratégie Impulsion (`impulse.py`)
 
-**Actifs :** Volatility 10, 25, 50, 75, 100 et leurs variantes 1s. **Cascade (HTF → MTF → LTF) :** D1→H4→H1, H4→H1→M15, H1→M15→M5 (`CASCADES` dans `bot.py`, utilisée uniquement par l'Impulsion).
+**Actifs (18) :** tous les indices synthétiques : Volatility 10, 25, 50, 75, 100, leurs variantes 1s (10, 15, 25, 30, 50, 75, 90, 100, 150, 200, 250, 300) et le Step Index (`SYMBOLS` dans `impulse.py`, qui reprend `SYNTHETIC_SYMBOLS` de `bot.py`). Les 8 variantes et le Step Index viennent de l'ancien périmètre du CRT : retire-les de `SYMBOLS` pour revenir aux 10 Volatility Index d'origine. **Cascade (HTF → MTF → LTF) :** D1→H4→H1, H4→H1→M15, H1→M15→M5 (`CASCADES` dans `bot.py`, utilisée uniquement par l'Impulsion).
 
 **Règles (écrites pour un achat, la vente est le miroir)**
 1. Tendance (HTF) : haussière selon `bot.trend_info` (voir « Lecture de la tendance » : structure de marché précoce par défaut, structure avec cassure impulsive en mode `deplacement`, ou 3 swings + SMA 50 en mode `swings`). L'âge de la tendance est enregistré dans le suivi et le backtest. Sinon, pas de signal. `STRICT_TREND = False` rétablit l'ancienne règle, encore plus souple : les 2 derniers sommets et creux plus hauts, sans cassure ni SMA.
@@ -161,7 +163,7 @@ Répond à la question : « la clôture d'une bougie D1 ou W1 permet-elle de pr�
 
 Une règle n'est « retenue » que si elle passe les trois contrôles, avec au moins 200 signaux en découverte et 100 en validation. Le résumé donne l'écart en points de pourcentage au-dessus du hasard, le nombre de symboles qui vont dans le même sens, et les règles les plus proches du seuil. Le CSV contient tous les tests.
 
-- **Sur GitHub :** Actions → CRT Bias Study → Run workflow, avec les classes (par défaut les trois) et le nombre de bougies D1 par symbole. Environ 1 à 2 minutes pour les 47 actifs. Le résumé s'affiche dans la page de l'exécution et `bias_study.csv` est dans les artefacts.
+- **Sur GitHub :** Actions → CRT Bias Study → Run workflow, avec les classes (par défaut les trois) et le nombre de bougies D1 par symbole. Environ 1 à 2 minutes pour les 47 actifs (29 du CRT et 18 indices synthétiques). Le résumé s'affiche dans la page de l'exécution et `bias_study.csv` est dans les artefacts.
 - **En local :** `python bias_study.py --classes crypto --max-bars 2000` (`--no-trend` ignore les règles de tendance, plus rapide).
 - **Testé sur données fictives :** sur 12 jeux de bruit pur, aucune règle n'a été retenue à tort ; une forte dérive haussière sans prédictibilité n'a rien produit non plus ; une autocorrélation injectée dans les cryptos a bien été détectée. C'est un test de la méthode, pas des marchés réels.
 - **Limites :** les symboles d'une même classe sont corrélés (les paires forex partagent le dollar), donc le test est optimiste : le nombre de symboles concordants et la validation sont les garde-fous. Un écart de 1 à 2 points ne couvre généralement pas le spread et le glissement. Un biais de direction ne dit rien de l'amplitude du mouvement. Les Volatility Index sont un tirage aléatoire sans mémoire : un signal « retenu » y serait suspect.
@@ -221,7 +223,8 @@ Chaque TP affiche son ratio gain/risque, calculé depuis l'entrée prévue (le f
 
 | Où | Constante | Effet |
 |---|---|---|
-| `bot.py` | `SYMBOLS` | Liste des actifs du CRT (47) |
+| `bot.py` | `SYMBOLS` | Liste des actifs du CRT (29 : forex, or, cryptos) |
+| `bot.py` | `SYNTHETIC_SYMBOLS` | Liste des indices synthétiques (18), reprise par `impulse.py` |
 | `bot.py` | `REFERENCE_CONFIRMATION_MAP` | Référence (W1, D1, H4) et timeframe de confirmation associé |
 | `bot.py` | `STRUCTURE_SWING_WINDOW`, `DEFAULT_STRUCTURE_SWING_WINDOW` | Fenêtre des swings de la cassure de structure, par timeframe de confirmation |
 | `bot.py` | `TREND_SWING_WINDOW`, `TREND_SWING_COUNT`, `TREND_SMA_PERIOD` | Mode `swings` : fenêtre, nombre de swings et SMA de la tendance |
@@ -231,7 +234,7 @@ Chaque TP affiche son ratio gain/risque, calculé depuis l'entrée prévue (le f
 | `bot.py` | `TREND_STRUCTURE_WINDOW` | Mode structure : bougies de confirmation d'un pivot |
 | `bot.py` | `KILLZONES_NY` | Noms et horaires des sessions (heure de New York) |
 | `bot.py` | `REQUIRE_KILLZONE_FOR_REAL_MARKETS` | `True` ignore les sweeps hors killzone (forex et or) |
-| `bot.py` | `KILLZONE_24_7` | `True` pour filtrer aussi cryptos et indices synthétiques |
+| `bot.py` | `KILLZONE_24_7` | `True` pour filtrer aussi les cryptos |
 | `bot.py` | `NY_ALIGNED` | Alignement 17h New York pour le forex et l'or (désactivé par défaut) |
 | `bot.py` | `WEEKEND_GAP_PREFIXES`, `WEEKEND_GAP_MULTIPLIER` | Filtre de gap de weekend |
 | `bot.py` | `LIQUIDITY_POOL_SWING_WINDOW`, `LIQUIDITY_POOL_TOLERANCE_PCT`, `STOP_LOSS_POOL_BUFFER_PCT` | Pools de liquidité et marge de SL associée |
@@ -246,7 +249,7 @@ Chaque TP affiche son ratio gain/risque, calculé depuis l'entrée prévue (le f
 | `bot.py` | `OB_LOOKBACK` | Distance maximale (en bougies de confirmation) entre l'OB et la cassure |
 | `bot.py` | `REQUIRE_FIB_OTE` | Rend l'OTE obligatoire pour une alerte CRT |
 | `bot.py` | `MIN_INTERVAL`, `MAX_RETRIES` | Débit et nombre d'essais du client Deriv |
-| `impulse.py` | `SYMBOLS` | Liste des indices de la stratégie Impulsion |
+| `impulse.py` | `SYMBOLS` | Actifs de la stratégie Impulsion (par défaut `SYNTHETIC_SYMBOLS`, 18 indices) |
 | `impulse.py` | `STRICT_TREND` | `True` : 3 swings + SMA 50 pour la tendance ; `False` : ancienne règle à 2 swings |
 | `impulse.py` | `ZONE` | Zone de retracement acceptée (0,5 à 0,79) |
 | `impulse.py` | `IMPULSE_ATR` | Taille minimale de la jambe (2 ATR) |

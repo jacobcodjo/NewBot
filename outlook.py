@@ -45,7 +45,7 @@ def week_key(now):
 
 
 def symbols_in_scope():
-    return [s for s in bot.SYMBOLS if OUTLOOK_INCLUDE_SYNTHETIC or not bot.is_synthetic(s)]
+    return [s for s in bot.UNIVERSE if OUTLOOK_INCLUDE_SYNTHETIC or not bot.is_synthetic(s)]
 
 
 def should_send(now, marker):

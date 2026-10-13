@@ -7,10 +7,10 @@ Les calculs sont écrits pour un achat ; pour une vente, les bougies sont invers
 import os, time
 import tracker
 from bot import (Deriv, get_candles, load, save, notify, body_avg, swings, detect_trend, trend_info,
+                 SYNTHETIC_SYMBOLS, check_symbols,
                  display_name, fmt, code, decimals, ratio_txt, GRAN, CASCADES, CACHE_FILE)
 
-SYMBOLS = ["R_10", "R_25", "R_50", "R_75", "R_100",
-           "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
+SYMBOLS = list(SYNTHETIC_SYMBOLS)   # tous les indices synthétiques (liste dans bot.py) ; retire-en pour restreindre
 STATE_FILE = "impulse_state.json"
 STATS_FILE = "trade_stats_impulse.json"   # suivi des trades de l'Impulsion (tracker.py)
 
@@ -295,6 +295,7 @@ def main():
     sent, pending = st.setdefault("sent", {}), st.setdefault("pending", {})
     api, alerts = Deriv(), 0
     try:
+        check_symbols(api, SYMBOLS)
         check_pending(api, cache, pending)
         for sym in SYMBOLS:
             get = lambda tf, force=False, sym=sym: get_candles(api, cache, sym, GRAN[tf], force=force)

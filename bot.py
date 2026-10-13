@@ -36,6 +36,10 @@ SYMBOLS = [
     "frxXAUUSD",
     # Cryptos
     "cryBTCUSD", "cryETHUSD", "cryLTCUSD", "cryXRPUSD",
+]   # SYMBOLS : actifs du CRT = forex, or et cryptos (les indices synthétiques relèvent de l'Impulsion)
+
+# Indices synthétiques : scannés par impulse.py (stratégie Impulsion), plus par le CRT.
+SYNTHETIC_SYMBOLS = [
     # Volatility Index classiques (10/25/50/75/100) et variantes 1 seconde
     "R_10", "R_25", "R_50", "R_75", "R_100",
     "1HZ10V", "1HZ15V", "1HZ25V", "1HZ30V", "1HZ50V", "1HZ75V",
@@ -43,6 +47,7 @@ SYMBOLS = [
     # Step Index
     "stpRNG",
 ]
+UNIVERSE = SYMBOLS + SYNTHETIC_SYMBOLS   # tous les actifs suivis (récapitulatif hebdomadaire, étude de prédictibilité)
 GRAN = {"D1": 86400, "H4": 14400, "H1": 3600, "M15": 900, "M5": 300}
 # Cascades (HTF, MTF, LTF) : utilisées uniquement par impulse.py. Le CRT n'en dépend plus.
 CASCADES = [("D1", "H4", "H1"), ("H4", "H1", "M15"), ("H1", "M15", "M5")]
@@ -789,14 +794,15 @@ def crt_message(s, price, dec=None):
     return "\n".join(lines)
 
 
-def check_symbols(api):
+def check_symbols(api, symbols=None):
     """Journalise les symboles absents chez Deriv (diagnostic uniquement)."""
+    symbols = SYMBOLS if symbols is None else symbols
     try:
         msg = api.request({"active_symbols": "brief"})
         names = {x.get("symbol") or x.get("underlying_symbol")
                  for x in (msg or {}).get("active_symbols", [])}
         if names:
-            missing = [s for s in SYMBOLS if s not in names]
+            missing = [s for s in symbols if s not in names]
             print(f"Symboles Deriv : {len(names)} dispo, absents de ma liste : {missing or 'aucun'}")
     except Exception as e:
         print(f"check_symbols ignoré: {e}")

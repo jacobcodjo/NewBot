@@ -325,9 +325,9 @@ def main():
         if c not in CLASS_KEYS:
             sys.exit(f"Classe inconnue : {c} (choix : {', '.join(CLASS_KEYS)})")
         wanted.append(CLASS_KEYS[c])
-    symbols = [s.strip() for s in a.symbols.split(",") if s.strip()] or bot.SYMBOLS
+    symbols = [s.strip() for s in a.symbols.split(",") if s.strip()] or bot.UNIVERSE
     symbols = [s for s in symbols if tracker.asset_class(s) in wanted]
-    unknown = [s for s in symbols if s not in bot.SYMBOLS]
+    unknown = [s for s in symbols if s not in bot.UNIVERSE]
     if unknown:
         sys.exit(f"Symboles inconnus : {unknown}")
     rules = list(SIMPLE_RULES) + ([] if a.no_trend else list(TREND_RULES))
