@@ -7,15 +7,17 @@ Deux scripts Python qui analysent les bougies de l'API Deriv et envoient des ale
 | `bot.py` | Stratégie CRT (Candle Range Trading) sur 47 actifs, plus le client Deriv, les notifications et les fonctions partagées avec `impulse.py` |
 | `impulse.py` | Stratégie Impulsion + retracement Fibonacci sur 10 Volatility Index |
 | `outlook.py` | Récapitulatif hebdomadaire du biais D1/W1 (repris de pa-bot) |
+| `bias_study.py` | Étude de prédictibilité : la clôture D1 ou W1 prédit-elle la direction de la bougie suivante ? |
 | `tracker.py` | Suivi automatique des trades du CRT (`trade_stats.json`) et de l'Impulsion (`trade_stats_impulse.json`) |
 | `backtest.py` | Backtest du CRT et de l'Impulsion sur l'historique Deriv |
 | `crt.yml` | Workflow GitHub Actions du bot, à placer dans `.github/workflows/crt.yml` |
 | `backtest.yml` | Workflow GitHub Actions du backtest, à placer dans `.github/workflows/backtest.yml` |
+| `bias-study.yml` | Workflow GitHub Actions de l'étude de prédictibilité, à placer dans `.github/workflows/bias-study.yml` |
 | `requirements.txt` | Dépendances (`websocket-client`, `requests`) |
 
 ## Mise en place
 
-1. Crée un dépôt GitHub. Mets `bot.py`, `impulse.py`, `outlook.py`, `tracker.py`, `backtest.py` et `requirements.txt` à la racine. Pour les workflows, crée les fichiers `.github/workflows/crt.yml` et `.github/workflows/backtest.yml` (« Add file → Create new file », avec ce chemin comme nom) et colle le contenu de `crt.yml` et de `backtest.yml`.
+1. Crée un dépôt GitHub. Mets `bot.py`, `impulse.py`, `outlook.py`, `tracker.py`, `backtest.py`, `bias_study.py` et `requirements.txt` à la racine. Pour les workflows, crée les fichiers `.github/workflows/crt.yml` et `.github/workflows/backtest.yml` (« Add file → Create new file », avec ce chemin comme nom) et colle le contenu de `crt.yml` et de `backtest.yml`. Ajoute de même `.github/workflows/bias-study.yml` pour l'étude de prédictibilité.
 2. Crée un bot Telegram avec @BotFather (`/newbot`) et garde le token.
 3. Envoie un message à ton bot, puis ouvre `https://api.telegram.org/bot<TOKEN>/getUpdates` pour lire ton `chat id` (`"chat":{"id":...}`).
 4. Dans le dépôt : Settings → Secrets and variables → Actions → New repository secret. Crée `TELEGRAM_TOKEN` et `TELEGRAM_CHAT_ID` (noms exacts, dans « Repository secrets »).
@@ -147,6 +149,22 @@ Deux pivots consécutifs au même prix comptent pour un seul swing.
 Sur un marché fictif haussier avec dérive, `structure` annonce une tendance haussière 84 % du temps, `swings` 69 % et `deplacement` 65 %. Lecture : `deplacement` supprime une grande partie des faux départs de `structure` sans retarder les retournements impulsifs, mais il ignore les retournements progressifs et capte un peu moins de tendance. `structure` détecte le plus tôt et le plus souvent, au prix du bruit. Sur les Volatility Index, marchés simulés sans vraie tendance, aucune règle ne détecte quelque chose de réel. Aucun mode n'est « le bon » : compare-les sur l'historique réel avec `python backtest.py --trend-mode all` avant de choisir.
 
 **Changer de règle sans modifier le code :** crée une variable de dépôt `TREND_MODE` (Settings → Secrets and variables → Actions → Variables) avec la valeur `structure`, `deplacement` ou `swings`. Sans variable, c'est `structure`.
+
+## Étude de prédictibilité (`bias_study.py`)
+
+Répond à la question : « la clôture d'une bougie D1 ou W1 permet-elle de prédire la direction de la suivante ? » sur l'historique Deriv (5000 bougies D1 par requête, 1500 par défaut). Pour chaque classe d'actif (Forex/Or, Crypto, Synthétiques) et chaque timeframe (D1, W1), elle teste sept règles de biais : clôture au-delà du plus haut ou plus bas précédent, clôture dans le tiers haut ou bas, direction de la bougie, bougie impulsive (corps d'au moins 1,5 fois la moyenne), et les trois lectures de tendance (`structure`, `deplacement`, `swings`). La cible est la direction de la bougie suivante, de l'ouverture à la clôture.
+
+**Contre les faux positifs :**
+- **Dérive neutralisée :** le taux attendu au hasard tient compte de la part de bougies haussières de l'échantillon. Un marché qui monte en moyenne ne rend pas un signal « acheteur » prédictif.
+- **Correction du nombre de tests (Holm)** : parmi des dizaines de combinaisons, certaines paraissent significatives par pur hasard.
+- **Validation hors échantillon :** la règle est choisie sur les 70 % de bougies les plus anciennes de chaque symbole, puis doit être confirmée, dans le même sens et avec p < 0,05, sur les 30 % les plus récentes.
+
+Une règle n'est « retenue » que si elle passe les trois contrôles, avec au moins 200 signaux en découverte et 100 en validation. Le résumé donne l'écart en points de pourcentage au-dessus du hasard, le nombre de symboles qui vont dans le même sens, et les règles les plus proches du seuil. Le CSV contient tous les tests.
+
+- **Sur GitHub :** Actions → CRT Bias Study → Run workflow, avec les classes (par défaut les trois) et le nombre de bougies D1 par symbole. Environ 1 à 2 minutes pour les 47 actifs. Le résumé s'affiche dans la page de l'exécution et `bias_study.csv` est dans les artefacts.
+- **En local :** `python bias_study.py --classes crypto --max-bars 2000` (`--no-trend` ignore les règles de tendance, plus rapide).
+- **Testé sur données fictives :** sur 12 jeux de bruit pur, aucune règle n'a été retenue à tort ; une forte dérive haussière sans prédictibilité n'a rien produit non plus ; une autocorrélation injectée dans les cryptos a bien été détectée. C'est un test de la méthode, pas des marchés réels.
+- **Limites :** les symboles d'une même classe sont corrélés (les paires forex partagent le dollar), donc le test est optimiste : le nombre de symboles concordants et la validation sont les garde-fous. Un écart de 1 à 2 points ne couvre généralement pas le spread et le glissement. Un biais de direction ne dit rien de l'amplitude du mouvement. Les Volatility Index sont un tirage aléatoire sans mémoire : un signal « retenu » y serait suspect.
 
 ## Récapitulatif hebdomadaire (`outlook.py`)
 
