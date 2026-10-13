@@ -1,0 +1,30 @@
+name: CRT Bias Study
+on:
+  workflow_dispatch:
+    inputs:
+      classes:
+        description: "Classes d'actifs séparées par des virgules : forex, crypto, synthetiques"
+        default: "forex,crypto,synthetiques"
+      max_bars:
+        description: "Bougies D1 récentes utilisées par symbole (5000 maximum)"
+        default: "1500"
+concurrency:
+  group: crt-bias-study
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python bias_study.py --classes "${{ github.event.inputs.classes }}" --max-bars "${{ github.event.inputs.max_bars }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bias-study
+          path: bias_study.csv
