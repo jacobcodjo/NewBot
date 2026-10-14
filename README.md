@@ -4,7 +4,7 @@ Deux scripts Python qui analysent les bougies de l'API Deriv et envoient des ale
 
 | Fichier | Rôle |
 |---|---|
-| `bot.py` | Stratégie CRT (Candle Range Trading) sur 29 actifs (forex, or, cryptos), plus le client Deriv, les notifications et les fonctions partagées avec `impulse.py` |
+| `bot.py` | Stratégie CRT (Candle Range Trading) sur 11 actifs (forex majeurs, or, cryptos), plus le client Deriv, les notifications et les fonctions partagées avec `impulse.py` |
 | `impulse.py` | Stratégie Impulsion + retracement Fibonacci sur les 18 indices synthétiques |
 | `outlook.py` | Récapitulatif hebdomadaire du biais D1/W1 (repris de pa-bot) |
 | `bias_study.py` | Étude de prédictibilité : la clôture D1 ou W1 prédit-elle la direction de la bougie suivante ? |
@@ -49,9 +49,9 @@ Attention : 288 exécutions par jour dépassent le quota gratuit des dépôts pr
 
 Stratégie et liste d'actifs reprises de l'ancien Crt-Bot. Le client Deriv, le cache, les notifications, les entrées/sorties et les alertes du second bot restent ceux de ce dépôt.
 
-**Répartition par classe d'actifs :** le CRT couvre le forex, l'or et les cryptos ; l'Impulsion couvre les indices synthétiques. Aucun actif n'est scanné par les deux stratégies.
+**Répartition par classe d'actifs :** le CRT couvre les forex majeurs, l'or et les cryptos ; l'Impulsion couvre les indices synthétiques. Aucun actif n'est scanné par les deux stratégies.
 
-**Actifs du CRT (29) :** forex majeurs (EURUSD, GBPUSD, USDJPY, USDCHF, AUDUSD, USDCAD) et mineurs (paires croisées sans USD : EUR, GBP, AUD, CAD, CHF, NZD), l'or (XAUUSD), BTC, ETH, LTC et XRP. La liste est `SYMBOLS` dans `bot.py`. Les indices synthétiques sont dans `SYNTHETIC_SYMBOLS` (même fichier), scannés par `impulse.py`. Pour remettre un indice synthétique dans le CRT, ajoute-le à `SYMBOLS`.
+**Actifs du CRT (11) :** les six forex majeurs (EURUSD, GBPUSD, USDJPY, USDCHF, AUDUSD, USDCAD), l'or (XAUUSD), BTC, ETH, LTC et XRP. Les paires croisées sans USD (mineures) ne sont plus suivies, ni par le CRT, ni par le récapitulatif hebdomadaire. Pour ajouter NZDUSD, que certains comptent parmi les majeures, ajoute `"frxNZDUSD"` à `SYMBOLS`. La liste est `SYMBOLS` dans `bot.py`. Les indices synthétiques sont dans `SYNTHETIC_SYMBOLS` (même fichier), scannés par `impulse.py`. Pour remettre un indice synthétique dans le CRT, ajoute-le à `SYMBOLS`.
 
 **Principe**
 1. Range de référence : haut/bas de la dernière période **W1** (semaine ISO complète, dérivée des bougies D1), **D1** ou **H4** clôturée.
@@ -98,7 +98,7 @@ Chaque alerte est enregistrée dans un fichier de statistiques par stratégie : 
 
 Le script rejoue l'historique Deriv comme le bot l'aurait vu : à chaque clôture de bougie du timeframe de pas (M15 pour le CRT, M5 pour l'Impulsion), il reconstruit les bougies visibles, applique la stratégie, les mêmes verrous anti-doublon et le même suivi. Chaque alerte est ensuite suivie sur les bougies suivantes du timeframe de pas (plus fines que le suivi en direct, donc moins de cas SL et cible dans la même bougie).
 
-- **Sur GitHub :** Actions → CRT Backtest → Run workflow, avec la stratégie (`crt` ou `impulse`), la durée en jours et, si besoin, des symboles séparés par des virgules (par exemple `frxEURUSD,cryBTCUSD` pour le CRT, `R_75,1HZ100V` pour l'Impulsion ; un symbole d'une autre stratégie est refusé). Le résumé s'affiche dans la page de l'exécution et le fichier `backtest_crt.csv` ou `backtest_impulse.csv` (avec les colonnes `tendance`, `age_tendance`, `zone`, `ote` et `mode_tendance`) est téléchargeable dans les artefacts. Le backtest complet des 29 actifs du CRT prend quelques minutes, celui des 18 indices de l'Impulsion davantage (pas de 5 minutes).
+- **Sur GitHub :** Actions → CRT Backtest → Run workflow, avec la stratégie (`crt` ou `impulse`), la durée en jours et, si besoin, des symboles séparés par des virgules (par exemple `frxEURUSD,cryBTCUSD` pour le CRT, `R_75,1HZ100V` pour l'Impulsion ; un symbole d'une autre stratégie est refusé). Le résumé s'affiche dans la page de l'exécution et le fichier `backtest_crt.csv` ou `backtest_impulse.csv` (avec les colonnes `tendance`, `age_tendance`, `zone`, `ote` et `mode_tendance`) est téléchargeable dans les artefacts. Le backtest complet des 11 actifs du CRT est rapide, celui des 18 indices de l'Impulsion prend plus de temps (pas de 5 minutes).
 - **Lecture de tendance :** `--trend-mode structure` (défaut), `deplacement`, `swings`, ou `all`, qui rejoue le même historique avec les trois règles et affiche un tableau comparatif (setups, réussite, R moyen, contre-tendance). Le résumé de chaque mode contient un tableau par âge de tendance, et selon la stratégie un tableau par zone de retracement (Impulsion : Golden Zone 50-61,8 % contre OTE 61,8-79 %) ou selon que l'entrée tombe dans l'OTE ou non (CRT). Pour le CRT, la tendance n'est qu'une étiquette : seuls les résultats « contre-tendance » changent. Pour l'Impulsion, c'est un filtre : le nombre de setups change. Sur GitHub, c'est le champ « trend_mode » du workflow.
 - **En local :** `python backtest.py --strategy impulse --days 14 --symbols R_75,1HZ100V --trend-mode all`
 - **Résultat :** réussite et R moyen (SL = -1, gain = ratio de la cible : TP2 pour le CRT, TP1 pour l'Impulsion), plus TP1 atteint pour le CRT, globalement puis par classe d'actif, référence, tendance (CRT), type d'ordre et sens, plus les meilleurs et pires symboles (5 trades minimum).
@@ -163,7 +163,7 @@ Répond à la question : « la clôture d'une bougie D1 ou W1 permet-elle de pr�
 
 Une règle n'est « retenue » que si elle passe les trois contrôles, avec au moins 200 signaux en découverte et 100 en validation. Le résumé donne l'écart en points de pourcentage au-dessus du hasard, le nombre de symboles qui vont dans le même sens, et les règles les plus proches du seuil. Le CSV contient tous les tests.
 
-- **Sur GitHub :** Actions → CRT Bias Study → Run workflow, avec les classes (par défaut les trois) et le nombre de bougies D1 par symbole. Environ 1 à 2 minutes pour les 47 actifs (29 du CRT et 18 indices synthétiques). Le résumé s'affiche dans la page de l'exécution et `bias_study.csv` est dans les artefacts.
+- **Sur GitHub :** Actions → CRT Bias Study → Run workflow, avec les classes (par défaut les trois) et le nombre de bougies D1 par symbole. Environ 1 minute pour les 29 actifs (11 du CRT et 18 indices synthétiques). Le résumé s'affiche dans la page de l'exécution et `bias_study.csv` est dans les artefacts.
 - **En local :** `python bias_study.py --classes crypto --max-bars 2000` (`--no-trend` ignore les règles de tendance, plus rapide).
 - **Testé sur données fictives :** sur 12 jeux de bruit pur, aucune règle n'a été retenue à tort ; une forte dérive haussière sans prédictibilité n'a rien produit non plus ; une autocorrélation injectée dans les cryptos a bien été détectée. C'est un test de la méthode, pas des marchés réels.
 - **Limites :** les symboles d'une même classe sont corrélés (les paires forex partagent le dollar), donc le test est optimiste : le nombre de symboles concordants et la validation sont les garde-fous. Un écart de 1 à 2 points ne couvre généralement pas le spread et le glissement. Un biais de direction ne dit rien de l'amplitude du mouvement. Les Volatility Index sont un tirage aléatoire sans mémoire : un signal « retenu » y serait suspect.
@@ -223,7 +223,7 @@ Chaque TP affiche son ratio gain/risque, calculé depuis l'entrée prévue (le f
 
 | Où | Constante | Effet |
 |---|---|---|
-| `bot.py` | `SYMBOLS` | Liste des actifs du CRT (29 : forex, or, cryptos) |
+| `bot.py` | `SYMBOLS` | Liste des actifs du CRT (11 : forex majeurs, or, cryptos) |
 | `bot.py` | `SYNTHETIC_SYMBOLS` | Liste des indices synthétiques (18), reprise par `impulse.py` |
 | `bot.py` | `REFERENCE_CONFIRMATION_MAP` | Référence (W1, D1, H4) et timeframe de confirmation associé |
 | `bot.py` | `STRUCTURE_SWING_WINDOW`, `DEFAULT_STRUCTURE_SWING_WINDOW` | Fenêtre des swings de la cassure de structure, par timeframe de confirmation |

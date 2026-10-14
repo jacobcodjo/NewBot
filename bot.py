@@ -1,6 +1,6 @@
 """Bot Candle Range Trading (CRT) - stratégie et symboles de l'ancien crt-bot.
 Références W1 / D1 / H4 : sweep de liquidité sur un TF de confirmation proportionnel,
-cassure de structure + FVG et/ou Order Block. 50 actifs (forex, or, cryptos, Volatility, Step).
+cassure de structure + FVG et/ou Order Block. 11 actifs (forex majeurs, or, cryptos).
 Données : API websocket Deriv | Alertes : Telegram
 """
 import json, os, random, time
@@ -23,20 +23,13 @@ TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID")
 
 SYMBOLS = [
-    # Forex majeurs
+    # Forex majeurs uniquement (les paires croisées sans USD ont été retirées)
     "frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxUSDCHF", "frxAUDUSD", "frxUSDCAD",
-    # Forex mineures (paires croisées, sans USD)
-    "frxEURGBP", "frxEURJPY", "frxEURCHF", "frxEURAUD", "frxEURCAD", "frxEURNZD",
-    "frxGBPJPY", "frxGBPCHF", "frxGBPAUD", "frxGBPCAD", "frxGBPNZD",
-    "frxAUDCAD", "frxAUDCHF",
-    "frxCADCHF", "frxCADJPY",
-    "frxCHFJPY",
-    "frxNZDCAD", "frxNZDCHF",
     # Or
     "frxXAUUSD",
     # Cryptos
     "cryBTCUSD", "cryETHUSD", "cryLTCUSD", "cryXRPUSD",
-]   # SYMBOLS : actifs du CRT = forex, or et cryptos (les indices synthétiques relèvent de l'Impulsion)
+]   # SYMBOLS : actifs du CRT = forex majeurs, or et cryptos (les indices synthétiques relèvent de l'Impulsion)
 
 # Indices synthétiques : scannés par impulse.py (stratégie Impulsion), plus par le CRT.
 SYNTHETIC_SYMBOLS = [
