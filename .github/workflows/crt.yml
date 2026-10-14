@@ -15,6 +15,16 @@ jobs:
     timeout-minutes: 10
     env:
       TREND_MODE: ${{ vars.TREND_MODE }}   # variable de dépôt facultative : structure (défaut), deplacement ou swings
+      # variables de dépôt facultatives (voir README) ; vides = valeurs par défaut du code
+      NY_ALIGNED: ${{ vars.NY_ALIGNED }}
+      CRT_BLOCK_COUNTER_TREND: ${{ vars.CRT_BLOCK_COUNTER_TREND }}
+      CRT_REQUIRE_KILLZONE: ${{ vars.CRT_REQUIRE_KILLZONE }}
+      CRT_REQUIRE_FVG: ${{ vars.CRT_REQUIRE_FVG }}
+      CRT_REQUIRE_HTF_POI: ${{ vars.CRT_REQUIRE_HTF_POI }}
+      CRT_NEWS_FILTER: ${{ vars.CRT_NEWS_FILTER }}
+      CRT_CORRELATION_MODE: ${{ vars.CRT_CORRELATION_MODE }}
+      ACCOUNT_BALANCE: ${{ vars.ACCOUNT_BALANCE }}
+      RISK_PCT: ${{ vars.RISK_PCT }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
