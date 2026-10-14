@@ -1191,7 +1191,8 @@ def main():
                     ltf_by_tf[tf] = cs
             for s in select_best(analyze(sym, htf, ltf_by_tf)):
                 k_range, k_content = setup_keys(s)
-                if k_range in state or k_content in state:
+                legacy = k_range.rsplit("_", 1)[0]   # ancien format de clé (sans le sens) : évite de renvoyer un setup déjà alerté
+                if k_range in state or k_content in state or legacy in state:
                     continue
                 gate = risk_gate(stats, int(time.time()))
                 if gate:

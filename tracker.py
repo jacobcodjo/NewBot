@@ -88,10 +88,19 @@ def _fill_epoch(trade, candles):
     return None
 
 
+def migrate_trade(trade):
+    """Compatibilité : les trades enregistrés avant l'ajout de be_hit et rr_tp1 n'ont pas ces champs."""
+    trade.setdefault("be_hit", False)
+    if "rr_tp1" not in trade:
+        risk = abs(trade["entry"] - trade["stop_loss"])
+        trade["rr_tp1"] = round(abs(trade["tp1"] - trade["entry"]) / risk, 2) if trade.get("tp1") and risk > 0 else 0.0
+
+
 def resolve_trade(trade, candles):
     """Fait avancer un trade avec les bougies disponibles. Retourne 'TP', 'SL' ou None."""
     if not candles:
         return None
+    migrate_trade(trade)
     if not trade["filled"]:
         fe = _fill_epoch(trade, candles)
         if fe is None:
