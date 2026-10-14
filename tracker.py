@@ -53,7 +53,9 @@ def new_trade(setup, alert_epoch):
         "zone": setup.get("zone"), "ote": t.get("ote"),
         "alert_epoch": alert_epoch,
         "filled": market, "fill_epoch": alert_epoch if market else None,
-        "tp1_hit": False,
+        "tp1_hit": False, "be_hit": False,
+        "rr_tp1": round(abs(t["tp1"] - t["entry"]) / abs(t["entry"] - t["sl"]), 2)
+        if t["tp1"] and abs(t["entry"] - t["sl"]) > 0 else 0.0,
     }
 
 
@@ -105,12 +107,18 @@ def resolve_trade(trade, candles):
         on_fill = trade.get("fill_candle") and c["epoch"] == trade["fill_epoch"]
         sl = c["low"] <= trade["stop_loss"] if buy else c["high"] >= trade["stop_loss"]
         if sl:
+            if trade["tp1_hit"]:
+                trade["be_hit"] = True   # revenu au point d'entrée après TP1 : le SL géré (BE) aurait sorti la 2e moitié
             trade["resolved_epoch"] = c["epoch"]
             return "SL"
         if on_fill:
             continue  # bougie de remplissage : l'ordre des touches est inconnu, seul le SL est retenu
         win = c["high"] >= win_level if buy else c["low"] <= win_level
         tp1 = c["high"] >= trade["tp1"] if buy else c["low"] <= trade["tp1"]
+        if trade["tp1_hit"] and not trade["be_hit"] and not win:
+            # bougies suivant celle de TP1 : retour au point d'entrée = sortie à l'équilibre pour la gestion BE
+            if (c["low"] <= trade["entry"]) if buy else (c["high"] >= trade["entry"]):
+                trade["be_hit"] = True
         if tp1 or win:
             trade["tp1_hit"] = True
         if win:
@@ -125,11 +133,25 @@ def realized_r(h):
     return -1.0 if h["result"] == "SL" else h["risk_reward"]
 
 
+def managed_r(h):
+    """Gain en R avec la gestion « moitié à TP1, SL au point d'entrée, reste vers TP2 » (CRT, cible TP2) :
+    SL sans TP1 = -1 ; TP1 puis retour à l'entrée = 0,5 x R(TP1) ; TP2 atteint sans retour = 0,5 x R(TP1) + 0,5 x R(TP2).
+    Pour les autres cibles (Impulsion), identique à realized_r."""
+    if h.get("win_tp", "tp2") != "tp2" or not h.get("rr_tp1"):
+        return realized_r(h)
+    if h["result"] == "SL":
+        return 0.5 * h["rr_tp1"] if h.get("tp1_hit") else -1.0
+    if h.get("be_hit"):
+        return 0.5 * h["rr_tp1"]
+    return 0.5 * h["rr_tp1"] + 0.5 * h["risk_reward"]
+
+
 def _archive(stats, trade, result, when):
     stats["history"].append({
         "symbol": trade["symbol"], "direction": trade["direction"], "ref_tf": trade["ref_tf"],
         "order_type": trade["order_type"], "counter_trend": trade["counter_trend"],
         "risk_reward": trade["risk_reward"], "tp1_hit": trade["tp1_hit"],
+        "be_hit": trade.get("be_hit", False), "rr_tp1": trade.get("rr_tp1", 0.0),
         "win_tp": trade.get("win_tp", "tp2"),
         "zone": trade.get("zone"), "ote": trade.get("ote"),
         "result": result, "alert_epoch": trade["alert_epoch"], "resolved_epoch": when,
@@ -212,6 +234,7 @@ def summarize(stats, name="CRT", win="tp2"):
         g = f"Global : {wr[0]}% de réussite sur {wr[1]} trades, R moyen {r_avg:+.2f}"
         if win == "tp2":
             g += f", TP1 atteint {100 * sum(1 for h in resolved if h.get('tp1_hit')) / len(resolved):.0f}%"
+            g += f", R moyen géré (½ à TP1 + BE) {sum(managed_r(h) for h in resolved) / len(resolved):+.2f}"
         parts.append(g)
         ct = [h for h in resolved if h["counter_trend"]]
         if ct:  # sans setup à contre-tendance (Impulsion), la comparaison n'a pas de sens

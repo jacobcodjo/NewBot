@@ -10,6 +10,20 @@ import requests
 import websocket  # websocket-client
 import tracker
 
+
+def _env_flag(name, default):
+    """Variable d'environnement booléenne (1/true/oui) ; `default` si absente ou vide."""
+    v = os.getenv(name)
+    return default if v is None or v.strip() == "" else v.strip().lower() in ("1", "true", "oui", "yes", "vrai")
+
+
+def _env_float(name, default):
+    try:
+        return float(os.getenv(name) or default)
+    except ValueError:
+        return default
+
+
 APP_ID = os.getenv("DERIV_APP_ID", "1089")
 # 1) nouvel endpoint public Deriv (sans authentification), 2) ancien endpoint en secours.
 # On peut forcer un endpoint avec la variable d'environnement DERIV_WS_URL.
@@ -73,12 +87,15 @@ LIQUIDITY_POOL_TOLERANCE_PCT = 0.1 # écart (% du prix) pour considérer deux ni
 STOP_LOSS_POOL_BUFFER_PCT = 0.1    # marge SL supplémentaire si le SL tombe sur un pool (% du prix)
 
 NY = ZoneInfo("America/New_York")
-NY_ALIGNED = False                 # True : D1/H4 recalculés avec ouverture 17h New York (forex + or)
+NY_ALIGNED = _env_flag("NY_ALIGNED", False)   # True : D1/H4 recalculés avec ouverture 17h New York (forex + or)
+H1_LONG_COUNT = 1500               # bougies H1 lues pour reconstruire D1/H4 en mode NY_ALIGNED (~60 jours)
 KILLZONES_NY = [                   # (nom, h début, min début, h fin, min fin) en heure de New York
-    ("Londres", 3, 0, 6, 0),
-    ("New York", 8, 30, 11, 30),
+    ("Asie", 20, 0, 23, 59),
+    ("Londres", 2, 0, 5, 0),
+    ("New York", 7, 0, 10, 0),
+    ("London Close", 10, 0, 12, 0),
 ]
-REQUIRE_KILLZONE_FOR_REAL_MARKETS = False  # True : sweep hors killzone ignoré (forex/or seulement)
+REQUIRE_KILLZONE_FOR_REAL_MARKETS = _env_flag("CRT_REQUIRE_KILLZONE", False)  # True : sweep hors killzone ignoré (forex/or seulement)
 KILLZONE_24_7 = False              # True : filtre aussi cryptos et indices synthétiques
 SWING_N = 2                        # fractale utilisée par swings() (impulse.py)
 COUNT = 200
@@ -90,6 +107,64 @@ MIN_RISK_REWARD = 3.0              # ratio minimum (1 pour 3), calculé sur TP2
 ORDER_TYPE_TOLERANCE_PCT = 0.02    # écart (% du prix) sous lequel le prix est "déjà sur la zone" -> ordre au marché
 OB_LOOKBACK = 8                    # l'OB doit se trouver à 8 bougies LTF au plus avant la cassure
 REQUIRE_FIB_OTE = False            # True : l'entrée doit tomber dans l'OTE 61,8-79 % (sinon simple indication)
+
+# --- Validation de C2 (la bougie de manipulation doit finir dans le range de C1) ---
+REQUIRE_C2_CLOSE_INSIDE = True     # prix actuel dans le range ET aucune clôture LTF hors range après le sweep (sinon : vraie cassure)
+
+# --- Sweep : profondeur, fraîcheur, un seul côté ---
+SWEEP_MAX_RANGE_FRAC = 0.5         # profondeur maximale de la mèche de sweep (part du range de C1) ; au-delà : cassure, pas manipulation
+SWEEP_MAX_ATR = 3.0                # ... et en ATR du timeframe de confirmation
+SWEEP_MAX_AGE = {"H4": 24, "H1": 16, "M15": 16}   # ancienneté maximale du sweep, en bougies de confirmation
+SKIP_BOTH_SIDES_SWEPT = True       # C2 doit balayer un seul côté : si les deux côtés sont balayés (outside bar), pas de CRT
+
+# --- Qualité de C1 (taille du range par rapport à la volatilité du timeframe de référence) ---
+RANGE_MIN_ATR = 0.6                # range inférieur à 0,6 ATR : bruit
+RANGE_MAX_ATR = 2.5                # range supérieur à 2,5 ATR : SL large et TP2 irréaliste
+
+# --- Mitigation, expiration, zone d'intérêt HTF ---
+SKIP_MITIGATED = True              # ignore un setup dont l'entrée a déjà été retestée avant l'alerte
+EXPIRY_REF_CANDLES = 3             # ordre valable jusqu'à la fin de C3 (3 bougies de référence depuis l'ouverture de C1)
+REF_GRAN = {"W1": 7 * 86400, "D1": 86400, "H4": 4 * 3600}
+HTF_FVG_LOOKBACK = 30              # FVG non comblés cherchés sur les 30 dernières bougies de la référence (D1 pour le W1)
+HTF_FVG_TOL_ATR = 0.25             # tolérance autour de la zone (x ATR de la référence)
+REQUIRE_HTF_POI = _env_flag("CRT_REQUIRE_HTF_POI", False)   # True : le sweep doit se faire dans un FVG HTF (sinon : indication et priorité)
+
+# --- Qualité de la confirmation ---
+MSS_REQUIRE_DISPLACEMENT = True    # la bougie qui casse la structure doit être impulsive (corps >= MSS_BODY_MULT x corps moyen)
+MSS_BODY_MULT = 1.2
+FVG_MIN_ATR_FRAC = 0.1             # un FVG doit mesurer au moins 0,1 ATR du TF de confirmation
+FVG_DISP_BODY_MULT = 1.0           # ... et sa bougie centrale doit être dirigée, avec un corps >= 1 x corps moyen
+REQUIRE_FVG = _env_flag("CRT_REQUIRE_FVG", False)   # True : un FVG créé par le déplacement est obligatoire (l'OB seul ne suffit plus)
+
+# --- Biais et zone (premium / discount) ---
+BLOCK_COUNTER_TREND = _env_flag("CRT_BLOCK_COUNTER_TREND", False)  # True : un setup à contre-tendance D1 est ignoré (sinon : avertissement)
+REQUIRE_PREMIUM_DISCOUNT = True    # achat : entrée sous le milieu du range (discount) ; vente : au-dessus (premium)
+
+# --- Stop-loss adaptatif et coûts ---
+STOP_LOSS_BUFFER_ATR = 0.15        # marge du SL : max(STOP_LOSS_BUFFER_PCT, 0,15 x ATR du TF de confirmation) + spread
+SPREAD_PCT = {"frxXAU": 0.015, "frx": 0.003, "cry": 0.04}   # spread estimé (% du prix), préfixe le plus long retenu
+SLIPPAGE_PCT = 0.005               # glissement estimé (% du prix), utilisé par le backtest
+
+# --- News (forex et or) ---
+NEWS_FILTER = _env_flag("CRT_NEWS_FILTER", True)
+NEWS_BLOCK_BEFORE_MIN = 30         # pas d'alerte dans les 30 min avant ...
+NEWS_BLOCK_AFTER_MIN = 30          # ... et après l'annonce
+NEWS_INCLUDE_CRYPTO = True         # les annonces USD concernent aussi les cryptos
+NEWS_WARN_MIN = 60                 # avertit d'une annonce dans l'heure quand un trade est ouvert
+ROLLOVER_FILTER = True             # pas d'alerte forex/or pendant le rollover (spreads élargis)
+ROLLOVER_NY = (16 * 60 + 45, 17 * 60 + 30)   # fenêtre en minutes depuis minuit, heure de New York
+NEWS_FILE = "news.json"            # facultatif : [{"time": "2026-11-04T19:00:00Z", "currencies": ["USD"]}, ...] (FOMC, CPI, BCE...)
+# Le NFP (premier vendredi du mois, 8h30 New York) est ajouté automatiquement.
+
+# --- Risque ---
+ACCOUNT_BALANCE = _env_float("ACCOUNT_BALANCE", 0.0)   # capital (variable de dépôt) : active la ligne « Taille » des alertes
+RISK_PCT = _env_float("RISK_PCT", 1.0)                 # risque par trade (% du capital)
+MAX_DAILY_LOSS_R = 3.0             # alertes suspendues si les trades résolus du jour (R géré) cumulent -3 R ou moins
+MAX_WEEKLY_LOSS_R = 6.0            # ... ou -6 R sur la semaine
+MAX_OPEN_TRADES = 6                # plafond global de trades suivis (en attente ou ouverts)
+MAX_CORRELATED_OPEN = 2            # trades déjà ouverts/en attente sur le même côté d'un groupe corrélé (USD, cryptos)
+CORRELATION_MODE = os.getenv("CRT_CORRELATION_MODE", "flag")   # flag : avertissement | block : alerte retenue tant que l'exposition est pleine
+MANAGEMENT_NOTE = True             # ajoute la règle de gestion après TP1 (moitié à TP1, SL au point d'entrée)
 
 MIN_INTERVAL = 0.6      # s entre deux requêtes (throttle)
 MAX_RETRIES = 6
@@ -188,13 +263,13 @@ class Deriv:
         return msg.get("candles") if msg else None
 
 
-def get_candles(api, cache, symbol, gran, force=False):
+def get_candles(api, cache, symbol, gran, force=False, count=COUNT):
     """Cache : on ne re-télécharge que si la dernière bougie est clôturée."""
-    key = f"{symbol}_{gran}"
+    key = f"{symbol}_{gran}" + ("" if count == COUNT else f"_{count}")
     c = cache.get(key)
     if c and not force and time.time() < c[-1]["epoch"] + gran:
         return c
-    fresh = api.candles(symbol, gran)
+    fresh = api.candles(symbol, gran, count=count)
     if fresh:
         cache[key] = fresh
         return fresh
@@ -243,7 +318,7 @@ def aggregate_ny(h1, hours):
 
 def tf_candles(api, cache, sym, tf, force=False):
     if NY_ALIGNED and not is_247(sym) and tf in ("D1", "H4"):
-        h1 = get_candles(api, cache, sym, GRAN["H1"])
+        h1 = get_candles(api, cache, sym, GRAN["H1"], count=H1_LONG_COUNT)   # 200 H1 = 8 jours : trop court pour D1/W1/tendance
         return aggregate_ny(h1, 24 if tf == "D1" else 4) if h1 else None
     return get_candles(api, cache, sym, GRAN[tf], force=force)
 
@@ -283,25 +358,71 @@ def swings(m, kind, upto):
 # --------------------------------------------------------------------------
 # Détection CRT (stratégie de l'ancien crt-bot)
 # --------------------------------------------------------------------------
-def weekly_range(d1):
-    """Range W1 : haut/bas de la dernière semaine ISO complète, agrégé depuis les bougies D1."""
+def week_key(epoch, ny=False):
+    """Semaine ISO d'une bougie D1. En mode NY, la bougie ouvre à 17h New York : le dimanche 17h appartient
+    déjà à la nouvelle semaine (décalage de 7 h pour la ramener à minuit)."""
+    if ny:
+        return (datetime.fromtimestamp(epoch, NY) + timedelta(hours=7)).isocalendar()[:2]
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).isocalendar()[:2]
+
+
+def complete_weeks(d1, ny=False):
+    """Semaines ISO complètes (la semaine en cours est exclue), de la plus ancienne à la plus récente."""
     if not d1 or len(d1) < 2:
-        return None
+        return []
     weeks = {}
     for c in d1[:-1]:  # exclut la bougie du jour en cours
-        key = datetime.fromtimestamp(c["epoch"], tz=timezone.utc).isocalendar()[:2]
-        weeks.setdefault(key, []).append(c)
-    if len(weeks) < 2:
+        weeks.setdefault(week_key(c["epoch"], ny), []).append(c)
+    return [weeks[k] for k in sorted(weeks)[:-1]]  # la dernière clé est la semaine en cours (incomplète)
+
+
+def weekly_range(d1, ny=False):
+    """Range W1 : haut/bas de la dernière semaine ISO complète, agrégé depuis les bougies D1."""
+    wks = complete_weeks(d1, ny)
+    if not wks:
         return None
-    wk = weeks[sorted(weeks)[-2]]  # la dernière clé est la semaine en cours (incomplète)
+    wk = wks[-1]
     return {"high": max(c["high"] for c in wk), "low": min(c["low"] for c in wk),
             "epoch": wk[-1]["epoch"]}
 
 
-def ref_range(ref_n, htf):
+def ref_atr(ref_n, htf, ny=False):
+    """Volatilité typique d'une bougie de référence : ATR 14 (D1, H4) ou taille moyenne des 8 dernières semaines (W1)."""
+    if ref_n == "W1":
+        wks = complete_weeks(htf.get("D1"), ny)[-8:]
+        sizes = [max(c["high"] for c in w) - min(c["low"] for c in w) for w in wks]
+        return sum(sizes) / len(sizes) if sizes else 0.0
+    cs = htf.get(ref_n)
+    return _atr_before(cs, len(cs) - 1) if cs and len(cs) > 3 else 0.0
+
+
+def htf_poi(ref_n, htf, d, ext, atr):
+    """Le sweep (extrême ext) se fait-il dans un FVG HTF non comblé ? Achat : FVG haussier (demande) ; vente : baissier.
+    FVG cherchés sur la référence (D1 pour le W1), avant la bougie en formation."""
+    cs = htf.get("D1" if ref_n == "W1" else ref_n)
+    if not cs or len(cs) < 6:
+        return None
+    closed, tol, up = cs[:-1], HTF_FVG_TOL_ATR * atr, d == "BUY"
+    for i in range(len(closed) - 2, max(0, len(closed) - HTF_FVG_LOOKBACK) - 1, -1):
+        c1, c3 = closed[i - 1], closed[i + 1]
+        if up and c1["high"] < c3["low"]:
+            bottom, top = c1["high"], c3["low"]
+        elif not up and c1["low"] > c3["high"]:
+            bottom, top = c3["high"], c1["low"]
+        else:
+            continue
+        later = closed[i + 2:]
+        if any((c["close"] < bottom) if up else (c["close"] > top) for c in later):
+            continue  # comblé : une clôture a traversé toute la zone
+        if bottom - tol <= ext <= top + tol:
+            return {"bottom": bottom, "top": top}
+    return None
+
+
+def ref_range(ref_n, htf, ny=False):
     """Range de référence : W1 agrégé, ou dernière bougie D1/H4 clôturée."""
     if ref_n == "W1":
-        return weekly_range(htf.get("D1"))
+        return weekly_range(htf.get("D1"), ny)
     cs = htf.get(ref_n)
     if not cs or len(cs) < 2:
         return None
@@ -374,46 +495,80 @@ def detect_sweeps(ltf, rng, gran, check_gaps):
     return out
 
 
+def mss_displaced(m, j, d):
+    """La bougie j est-elle impulsive dans le sens d ? Corps >= MSS_BODY_MULT x corps moyen des 10 précédentes."""
+    c = m[j]
+    if (c["close"] > c["open"]) != (d == "BUY"):
+        return False
+    avg = body_avg(m[max(0, j - 10):j])
+    return avg > 0 and abs(c["close"] - c["open"]) >= MSS_BODY_MULT * avg
+
+
 def structure_shift(ltf, si, d, w):
-    """Après le sweep, une clôture casse le dernier swing dans le sens du retournement."""
+    """Après le sweep, une clôture casse le dernier swing dans le sens du retournement. Avec
+    MSS_REQUIRE_DISPLACEMENT, la bougie de cassure doit être impulsive (sinon : simple glissement du prix)."""
     highs, lows = find_pivots(ltf[:si + 1], w, w)
     if d == "SELL":
         if not lows:
             return None
         lvl = ltf[lows[-1]]["low"]
         for j in range(si + 1, len(ltf)):
-            if ltf[j]["close"] < lvl:
+            if ltf[j]["close"] < lvl and (not MSS_REQUIRE_DISPLACEMENT or mss_displaced(ltf, j, d)):
                 return {"j": j, "level": lvl}
     else:
         if not highs:
             return None
         lvl = ltf[highs[-1]]["high"]
         for j in range(si + 1, len(ltf)):
-            if ltf[j]["close"] > lvl:
+            if ltf[j]["close"] > lvl and (not MSS_REQUIRE_DISPLACEMENT or mss_displaced(ltf, j, d)):
                 return {"j": j, "level": lvl}
     return None
 
 
-def detect_fvg(cs, around, d, window=5):
-    """Fair Value Gap proche de l'index donné (haussier si BUY, baissier si SELL)."""
-    for i in range(max(1, around - window), min(len(cs) - 1, around + window)):
-        if i + 1 >= len(cs):
-            break
-        c1, c3 = cs[i - 1], cs[i + 1]
-        if d == "BUY" and c1["high"] < c3["low"]:
+def sweep_invalidated(ltf, si, d, rng):
+    """Le sweep a échoué si, depuis la bougie de sweep, une clôture est ressortie du range côté balayé :
+    ce n'est plus une manipulation mais une vraie cassure."""
+    for c in ltf[si + 1:]:
+        if (d == "SELL" and c["close"] > rng["high"]) or (d == "BUY" and c["close"] < rng["low"]):
+            return True
+    return False
+
+
+def detect_fvg(cs, lo, hi, d):
+    """Fair Value Gap créé par le déplacement entre le sweep (indice lo) et la cassure (indice hi), le plus récent
+    d'abord. Il faut une vraie bougie de déplacement au centre et un écart d'au moins FVG_MIN_ATR_FRAC x ATR."""
+    up = d == "BUY"
+    for i in range(min(len(cs) - 2, hi), lo, -1):
+        c1, c2, c3 = cs[i - 1], cs[i], cs[i + 1]
+        if up and not c1["high"] < c3["low"]:
+            continue
+        if not up and not c1["low"] > c3["high"]:
+            continue
+        gap = (c3["low"] - c1["high"]) if up else (c1["low"] - c3["high"])
+        if gap < FVG_MIN_ATR_FRAC * _atr_before(cs, i):
+            continue
+        avg = body_avg(cs[max(0, i - 10):i])
+        if (c2["close"] > c2["open"]) != up or (avg and abs(c2["close"] - c2["open"]) < FVG_DISP_BODY_MULT * avg):
+            continue
+        if up:
             return {"index": i, "top": c3["low"], "bottom": c1["high"]}
-        if d == "SELL" and c1["low"] > c3["high"]:
-            return {"index": i, "top": c1["low"], "bottom": c3["high"]}
+        return {"index": i, "top": c1["low"], "bottom": c3["high"]}
     return None
 
 
-def detect_order_block(cs, around, d, window=5):
-    """Dernière bougie opposée au mouvement, en remontant depuis l'index donné."""
-    for i in range(around, max(0, around - window) - 1, -1):
-        c = cs[i]
-        if (d == "BUY" and c["close"] < c["open"]) or (d == "SELL" and c["close"] > c["open"]):
-            return {"index": i, "high": c["high"], "low": c["low"]}
-    return None
+def ob_index(m, j, d, lo=0):
+    """Indice de l'Order Block : dernière bougie opposée avant la bougie de cassure j, après le sweep (indice lo)
+    et à OB_LOOKBACK bougies au plus de la cassure. Même définition pour le filtre et pour l'entrée."""
+    bull = d == "BUY"
+    x = j - 1
+    while x >= lo and not ((m[x]["close"] <= m[x]["open"]) if bull else (m[x]["close"] >= m[x]["open"])):
+        x -= 1
+    return x if x >= lo and j - x <= OB_LOOKBACK else None
+
+
+def detect_order_block(cs, j, d, lo=0):
+    x = ob_index(cs, j, d, lo)
+    return None if x is None else {"index": x, "high": cs[x]["high"], "low": cs[x]["low"]}
 
 
 def trend_pivots(closed, w):
@@ -552,50 +707,231 @@ def is_stale(d, j, t, cs):
     return False
 
 
+def is_mitigated(d, j, entry, ltf):
+    """L'entrée a-t-elle déjà été retestée avant l'alerte ? On regarde les bougies clôturées après la cassure, sauf la
+    plus récente (un retest en cours de formation donne un ordre au marché légitime)."""
+    for c in ltf[j + 1:-1]:
+        if (d == "SELL" and c["high"] >= entry) or (d == "BUY" and c["low"] <= entry):
+            return True
+    return False
+
+
+def setup_expiry(ref_n, rng):
+    """Fin de C3 : l'expansion est attendue pendant la bougie de référence qui suit C2. Pour le W1, rng['epoch'] est
+    l'ouverture de la dernière bougie D1 de la semaine."""
+    c1_end = rng["epoch"] + (86400 if ref_n == "W1" else REF_GRAN[ref_n])
+    return c1_end + (EXPIRY_REF_CANDLES - 1) * REF_GRAN[ref_n]
+
+
 def setup_keys(s):
-    """Clés anti-doublon : un setup par range de référence et par TF de confirmation,
+    """Clés anti-doublon : un setup par range de référence, par TF de confirmation et par sens,
     plus un contrôle sur le contenu (mêmes niveaux = même message)."""
     t = s["trade"]
-    return (f"{s['sym']}_{s['ref_n']}_{s['ref_epoch']}_{s['conf_n']}",
+    return (f"{s['sym']}_{s['ref_n']}_{s['ref_epoch']}_{s['conf_n']}_{s['dir']}",
             f"content_{s['sym']}_{s['dir']}_{round(t['entry'], 6)}_{round(t['sl'], 6)}_{round(t['tp2'], 6)}")
 
 
-def analyze(sym, htf, ltf_by_tf):
-    """Cherche les setups CRT d'un symbole : sweep -> cassure de structure -> FVG et/ou OB."""
+def spread_pct(sym):
+    """Spread estimé (% du prix) : préfixe le plus long de SPREAD_PCT (frxXAU avant frx), 0 sinon."""
+    for k in sorted(SPREAD_PCT, key=len, reverse=True):
+        if sym.startswith(k):
+            return SPREAD_PCT[k]
+    return 0.0
+
+
+_NEWS_CACHE = {}
+
+
+def _news_file_events():
+    """Événements de NEWS_FILE : liste de (epoch, {devises}). Lu une fois ; fichier absent ou invalide = aucun."""
+    if "file" not in _NEWS_CACHE:
+        out = []
+        try:
+            with open(NEWS_FILE, encoding="utf-8") as f:
+                for e in json.load(f):
+                    dt = datetime.fromisoformat(str(e["time"]).replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    out.append((dt.timestamp(), set(e.get("currencies") or ["USD"])))
+        except Exception:
+            pass
+        _NEWS_CACHE["file"] = out
+    return _NEWS_CACHE["file"]
+
+
+def nfp_events(epoch):
+    """NFP (premier vendredi du mois, 8h30 New York) du mois de `epoch` et des deux mois voisins."""
+    dt, out = datetime.fromtimestamp(epoch, NY), []
+    for k in (-1, 0, 1):
+        y, m = dt.year + (dt.month - 1 + k) // 12, (dt.month - 1 + k) % 12 + 1
+        first = datetime(y, m, 1, 8, 30, tzinfo=NY)
+        out.append((first.replace(day=1 + (4 - first.weekday()) % 7).timestamp(), {"USD"}))
+    return out
+
+
+def news_blackout(sym, epoch):
+    """True si `epoch` tombe dans la fenêtre d'une annonce concernant une devise du symbole (forex et or)."""
+    return bool(NEWS_FILTER and _news_hit(sym, epoch, NEWS_BLOCK_BEFORE_MIN * 60, NEWS_BLOCK_AFTER_MIN * 60))
+
+
+def _news_ccy(sym):
+    if sym.startswith("frx"):
+        return {sym[3:6], sym[6:9]}
+    if sym.startswith("cry") and NEWS_INCLUDE_CRYPTO:
+        return {"USD"}
+    return set()
+
+
+def _news_hit(sym, epoch, before_s, after_s):
+    """Epoch de la première annonce dont la fenêtre [annonce - before_s, annonce + after_s] contient `epoch`, sinon None."""
+    ccy = _news_ccy(sym)
+    if not ccy:
+        return None
+    for ts, cur in _news_file_events() + nfp_events(epoch):
+        if cur & ccy and ts - before_s <= epoch <= ts + after_s:
+            return ts
+    return None
+
+
+def news_upcoming(sym, epoch, minutes):
+    """Annonce touchant le symbole dans les `minutes` à venir (epoch de l'annonce) ou None."""
+    ccy = _news_ccy(sym)
+    for t, cur in _news_file_events() + nfp_events(epoch):
+        if cur & ccy and epoch < t <= epoch + minutes * 60:
+            return t
+    return None
+
+
+def rollover_blackout(sym, epoch):
+    """Fenêtre de rollover (17h New York) : spreads élargis, pas d'alerte pour le forex et l'or."""
+    if not ROLLOVER_FILTER or not sym.startswith("frx"):
+        return False
+    dt = datetime.fromtimestamp(epoch, NY)
+    return ROLLOVER_NY[0] <= dt.hour * 60 + dt.minute <= ROLLOVER_NY[1]
+
+
+def risk_gate(stats, now):
+    """Raison de suspendre les nouvelles alertes (plafond de trades, perte du jour ou de la semaine en R géré), sinon None."""
+    n_open = len(stats.get("pending", {}))
+    if n_open >= MAX_OPEN_TRADES:
+        return ("cap", f"{n_open} trades déjà suivis (plafond {MAX_OPEN_TRADES})")
+    dt = datetime.fromtimestamp(now, NY)
+    day0 = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    week0 = day0 - timedelta(days=day0.weekday())
+    done = [h for h in stats.get("history", []) if h["result"] in ("TP", "SL")]
+    day_r = sum(tracker.managed_r(h) for h in done if h.get("resolved_epoch", 0) >= day0.timestamp())
+    week_r = sum(tracker.managed_r(h) for h in done if h.get("resolved_epoch", 0) >= week0.timestamp())
+    if day_r <= -MAX_DAILY_LOSS_R:
+        return ("day", f"perte du jour {day_r:+.1f} R (limite -{MAX_DAILY_LOSS_R:g} R)")
+    if week_r <= -MAX_WEEKLY_LOSS_R:
+        return ("week", f"perte de la semaine {week_r:+.1f} R (limite -{MAX_WEEKLY_LOSS_R:g} R)")
+    return None
+
+
+def exposure_group(sym, d):
+    """(groupe, côté) de l'exposition : forex/or = côté du dollar, cryptos = sens du trade ; None sinon."""
+    s = sym[3:]
+    if sym.startswith("cry"):
+        return ("CRYPTO", 1 if d == "BUY" else -1)
+    if sym.startswith("frx"):
+        if s.endswith("USD"):
+            return ("USD", -1 if d == "BUY" else 1)   # acheter EURUSD ou l'or = vendre le dollar
+        if s.startswith("USD"):
+            return ("USD", 1 if d == "BUY" else -1)
+    return None
+
+
+def correlated_open(stats, sym, d):
+    """Nombre de trades suivis (en attente ou ouverts) sur le même côté du même groupe corrélé."""
+    g = exposure_group(sym, d)
+    if g is None:
+        return 0
+    return sum(1 for t in stats.get("pending", {}).values() if exposure_group(t["symbol"], t["direction"]) == g)
+
+
+REF_RANK = {"W1": 3, "D1": 2, "H4": 1}
+
+
+def select_best(setups):
+    """Un seul setup par symbole et par sens (les références W1/D1/H4 d'un même mouvement sont corrélées) :
+    la référence la plus haute, puis sweep dans un FVG HTF, puis dans une killzone, puis dans la tendance, puis le meilleur ratio."""
+    best = {}
+    for s in setups:
+        rank = (REF_RANK.get(s["ref_n"], 0), bool(s.get("poi")), s["session"] is not None, not s["counter"], s["trade"]["rr"])
+        k = (s["sym"], s["dir"])
+        if k not in best or rank > best[k][0]:
+            best[k] = (rank, s)
+    return [v[1] for v in best.values()]
+
+
+def analyze(sym, htf, ltf_by_tf, now=None):
+    """Cherche les setups CRT d'un symbole : sweep -> cassure de structure impulsive -> FVG et/ou OB.
+    `now` : instant de l'analyse (le backtest rejoue le passé)."""
+    now = time.time() if now is None else now
+    if news_blackout(sym, now) or rollover_blackout(sym, now):
+        return []   # pas de verrou : le setup sera renvoyé après la fenêtre s'il est toujours valide
     info = trend_info(htf["D1"]) if htf.get("D1") else {"trend": None, "age": None}
     trend = info["trend"]
     check_gaps = sym.startswith(WEEKEND_GAP_PREFIXES)
+    ny = NY_ALIGNED and not is_247(sym)
     setups = []
     for ref_n, conf_list in REFERENCE_CONFIRMATION_MAP.items():
-        rng = ref_range(ref_n, htf)
+        rng = ref_range(ref_n, htf, ny)
         if not rng:
             continue
+        expires = setup_expiry(ref_n, rng)
+        if now > expires:
+            continue  # C3 est terminée : l'expansion attendue n'a plus lieu d'être
+        size, r_atr = rng["high"] - rng["low"], ref_atr(ref_n, htf, ny)
+        if r_atr and not RANGE_MIN_ATR * r_atr <= size <= RANGE_MAX_ATR * r_atr:
+            continue  # range de C1 trop petit (bruit) ou trop grand (SL large, TP2 irréaliste)
         for conf_n in conf_list:
             full = ltf_by_tf.get(conf_n)
             if not full or len(full) < 20:
                 continue
             ltf = full[:-1]  # bougies clôturées uniquement (la dernière est en formation)
+            price = full[-1]["close"]
+            if REQUIRE_C2_CLOSE_INSIDE and not rng["low"] <= price <= rng["high"]:
+                continue  # C2 ne clôture pas dans le range de C1 : pas de CRT
             sweeps = detect_sweeps(ltf, rng, GRAN[conf_n], check_gaps)
             if not sweeps:
                 continue
+            if SKIP_BOTH_SIDES_SWEPT and {x["dir"] for x in sweeps} == {"BUY", "SELL"}:
+                continue  # les deux côtés balayés (outside bar) : ce n'est plus un CRT
             pools = find_liquidity_pools(ltf)
             w = STRUCTURE_SWING_WINDOW.get(conf_n, DEFAULT_STRUCTURE_SWING_WINDOW)
             for s in sweeps:
                 d, c = s["dir"], s["candle"]
+                if len(ltf) - 1 - s["i"] > SWEEP_MAX_AGE.get(conf_n, 10 ** 6):
+                    continue  # sweep trop ancien
+                depth = (c["high"] - rng["high"]) if d == "SELL" else (rng["low"] - c["low"])
+                if depth > SWEEP_MAX_RANGE_FRAC * size or depth > SWEEP_MAX_ATR * _atr_before(ltf, s["i"]):
+                    continue  # sweep trop profond : cassure plutôt que manipulation
+                if REQUIRE_C2_CLOSE_INSIDE and sweep_invalidated(ltf, s["i"], d, rng):
+                    continue
                 st = structure_shift(ltf, s["i"], d, w)
                 if not st:
                     continue
-                fvg = detect_fvg(ltf, st["j"], d)
-                ob = detect_order_block(ltf, s["i"], d)
+                fvg = detect_fvg(ltf, s["i"], st["j"], d)
+                ob = detect_order_block(ltf, st["j"], d, s["i"])
                 if not fvg and not ob:
                     continue  # pas de confirmation avancée
+                if REQUIRE_FVG and not fvg:
+                    continue
+                counter = (trend == "bullish" and d == "SELL") or (trend == "bearish" and d == "BUY")
+                if BLOCK_COUNTER_TREND and counter:
+                    continue
                 ext = c["high"] if d == "SELL" else c["low"]
-                sw = {"dir": d, "i": s["i"], "sl": ext, "range": rng, "closed": ltf}
+                poi = htf_poi(ref_n, htf, d, ext, r_atr)
+                if REQUIRE_HTF_POI and not poi:
+                    continue
+                sw = {"dir": d, "i": s["i"], "sl": ext, "range": rng, "closed": ltf, "fvg": fvg}
                 bos = {"j": st["j"], "m": ltf, "epoch": ltf[st["j"]]["epoch"]}
-                price = full[-1]["close"]
                 t = build_trade(sym, sw, bos, price, pools)
                 if t is None or is_stale(d, st["j"], t, full):
                     continue
+                if SKIP_MITIGATED and not is_synthetic(sym) and is_mitigated(d, st["j"], t["entry"], ltf):
+                    continue  # l'entrée a déjà été retestée : le setup est moins fiable
                 session = killzone(sym, c["epoch"])
                 if session is None and REQUIRE_KILLZONE_FOR_REAL_MARKETS:
                     continue
@@ -605,27 +941,27 @@ def analyze(sym, htf, ltf_by_tf):
                     "dir": d, "sw": sw, "fvg": fvg, "ob": ob, "trade": t, "ltf": ltf,
                     "price": price, "session": session,
                     "grabbed": near_level(ext, swept_pools),
-                    "counter": (trend == "bullish" and d == "SELL") or (trend == "bearish" and d == "BUY"),
+                    "counter": counter, "poi": poi,
+                    "expires": expires, "max_age": max(60, int(expires - now)),
                     "trend": trend, "trend_age": info["age"],
                 })
     return setups
 
 
-def entry_zone(m, j, d):
+def entry_zone(m, j, d, lo=0, fvg=None):
     """Zone d'entrée au niveau de la cassure LTF (bougie j), par priorité :
-    Order Block, sinon Breaker Block, sinon FVG (milieu). Retourne (nom, niveau, zone)."""
+    Order Block, sinon Breaker Block, sinon FVG (milieu). `lo` : indice du sweep (la zone doit lui être postérieure),
+    `fvg` : le FVG de déplacement déjà détecté. Retourne (nom, niveau, zone)."""
     bull = d == "BUY"
     opposite = (lambda c: c["close"] <= c["open"]) if bull else (lambda c: c["close"] >= c["open"])
-    # 1) Order Block : dernière bougie opposée avant le mouvement qui casse la structure
-    x = j - 1
-    while x >= 0 and not opposite(m[x]):
-        x -= 1
-    if x >= 0 and j - x <= OB_LOOKBACK:
+    # 1) Order Block : dernière bougie opposée avant le mouvement qui casse la structure (après le sweep)
+    x = ob_index(m, j, d, lo)
+    if x is not None:
         z = (m[x]["low"], m[x]["high"])
         return "Order Block", (z[1] if bull else z[0]), z
     # 2) Breaker Block : dernière bougie dans le sens du trade avant le creux (sommet) de manipulation,
     #    dont la clôture de cassure franchit l'extrême
-    seg = range(max(0, j - 12), j)
+    seg = range(max(lo, j - 12), j)
     if len(seg) >= 3:
         piv = min(seg, key=lambda t: m[t]["low"]) if bull else max(seg, key=lambda t: m[t]["high"])
         y = piv - 1
@@ -634,7 +970,10 @@ def entry_zone(m, j, d):
         if y >= 0 and ((m[j]["close"] > m[y]["high"]) if bull else (m[j]["close"] < m[y]["low"])):
             z = (m[y]["low"], m[y]["high"])
             return "Breaker Block", (z[1] if bull else z[0]), z
-    # 3) FVG : milieu de l'écart laissé par le mouvement de cassure
+    # 3) FVG : milieu du FVG de déplacement (sinon de l'écart laissé par la bougie de cassure)
+    if fvg:
+        z = (fvg["bottom"], fvg["top"])
+        return "FVG 50 %", (z[0] + z[1]) / 2, z
     for i in (j, j + 1):
         if 2 <= i < len(m):
             if bull and m[i]["low"] > m[i - 2]["high"]:
@@ -678,15 +1017,19 @@ def build_trade(sym, sw, bos, price, pools=None):
     if synth:   # indices synthétiques : entrée immédiate à la clôture de la bougie de cassure
         entry, how = m[j]["close"], "clôture de la cassure"
     else:
-        z = entry_zone(m, j, d)
+        z = entry_zone(m, j, d, lo=sw.get("i", 0), fvg=sw.get("fvg"))
         if not z:
             return None  # aucun OB, Breaker ni FVG : setup ignoré
         how, entry = z[0], z[1]
     hi, lo = rng["high"], rng["low"]
     ext = sw["sl"]  # extrême de la bougie de sweep
-    buf = ext * STOP_LOSS_BUFFER_PCT / 100
+    # marge adaptative : au moins STOP_LOSS_BUFFER_PCT du prix, ou STOP_LOSS_BUFFER_ATR x ATR si plus grand, + spread
+    buf = max(ext * STOP_LOSS_BUFFER_PCT / 100, STOP_LOSS_BUFFER_ATR * _atr_before(m, j + 1)) \
+        + ext * spread_pct(sym) / 100
     extra = (hi - lo) * TP_EXTENSION_PCT / 100
     mid = (hi + lo) / 2
+    if REQUIRE_PREMIUM_DISCOUNT and ((entry > mid) if buy else (entry < mid)):
+        return None  # achat en premium / vente en discount : TP1 (mi-range) serait déjà derrière l'entrée
     if buy:
         sl, tp1, tp2, tp3 = ext - buf, mid, hi, hi + extra
     else:
@@ -759,6 +1102,21 @@ def ratio_txt(d, entry, sl, tp):
     return "   (dépassé)" if gain <= 0 else f"   (1:{gain / risk:.1f})"
 
 
+def size_line(sym, entry, sl):
+    """Taille de position pour RISK_PCT % de ACCOUNT_BALANCE (approximation : les contrats du courtier peuvent différer)."""
+    if ACCOUNT_BALANCE <= 0 or abs(entry - sl) <= 0:
+        return None
+    risk, dist, s = ACCOUNT_BALANCE * RISK_PCT / 100, abs(entry - sl), sym[3:]
+    units = risk * entry / dist if (s.startswith("USD") and not s.endswith("USD")) else risk / dist  # risque en devise cotée
+    if sym.startswith("frxXAU"):
+        txt = f"{units / 100:.2f} lot ({units:.1f} oz)"
+    elif sym.startswith("frx"):
+        txt = f"{units / 100000:.2f} lot"
+    else:
+        txt = f"{units:.4g} {s[:-3]}"
+    return f"💼 Taille ≈ {txt} (risque {RISK_PCT:g} %)"
+
+
 def crt_message(s, price, dec=None):
     c = lambda v: code(v, dec)
     t, sw, d, r = s["trade"], s["sw"], s["dir"], s["sw"]["range"]
@@ -782,8 +1140,19 @@ def crt_message(s, price, dec=None):
         lines.append("✅ OTE (61,8-79 %)")
     if s["grabbed"]:
         lines.append("💧 Pool de liquidité balayé")
+    if s.get("poi"):
+        lines.append(f"🎯 Sweep dans un FVG {s['ref_n'] if s['ref_n'] != 'W1' else 'D1'}  {c(s['poi']['bottom'])} - {c(s['poi']['top'])}")
     if s["counter"]:
         lines.append("⚠️ Contre-tendance (D1)")
+    if s.get("corr"):
+        lines.append(f"⚠️ Corrélation : {s['corr']} trade(s) déjà ouvert(s) ou en attente sur le même côté ({exposure_group(s['sym'], d)[0]})")
+    sz = size_line(s["sym"], t["entry"], t["sl"])
+    if sz:
+        lines.append(sz)
+    if s.get("expires"):
+        lines.append("⏳ Ordre valable jusqu'au " + datetime.fromtimestamp(s["expires"], timezone.utc).strftime("%d/%m %H:%M UTC"))
+    if MANAGEMENT_NOTE:
+        lines.append("📌 Gestion : la moitié à TP1, SL au point d'entrée, le reste vers TP2")
     return "\n".join(lines)
 
 
@@ -820,10 +1189,24 @@ def main():
                 cs = tf_candles(api, cache, sym, tf)
                 if cs and time.time() - cs[-1]["epoch"] <= 3 * GRAN[tf]:  # sinon : marché fermé
                     ltf_by_tf[tf] = cs
-            for s in analyze(sym, htf, ltf_by_tf):
+            for s in select_best(analyze(sym, htf, ltf_by_tf)):
                 k_range, k_content = setup_keys(s)
                 if k_range in state or k_content in state:
                     continue
+                gate = risk_gate(stats, int(time.time()))
+                if gate:
+                    day = datetime.now(NY).strftime("%Y%m%d")
+                    print(f"{sym} {s['dir']} retenu : {gate[1]}")
+                    if f"riskpause_{gate[0]}_{day}" not in state:   # un seul message par motif et par jour
+                        state[f"riskpause_{gate[0]}_{day}"] = int(time.time())
+                        notify(f"⏸ Alertes CRT suspendues : {gate[1]}.")
+                    continue   # pas de verrou : renvoyé quand la limite n'est plus atteinte
+                n_corr = correlated_open(stats, sym, s["dir"])
+                if n_corr >= MAX_CORRELATED_OPEN:
+                    if CORRELATION_MODE == "block":
+                        print(f"{sym} {s['dir']} retenu : {n_corr} trades déjà sur le même côté ({exposure_group(sym, s['dir'])[0]})")
+                        continue   # pas de verrou : renvoyé quand l'exposition baisse
+                    s["corr"] = n_corr
                 now = int(time.time())
                 state[k_range] = state[k_content] = now
                 t = s["trade"]
@@ -834,6 +1217,16 @@ def main():
                 sent += 1
                 notify(crt_message(s, price, decimals(s["ltf"])), html=True)
                 tracker.add_pending(stats, k_range, s, now)
+        # trades ouverts : avertissement avant une annonce
+        t_now = int(time.time())
+        for key, tr in stats["pending"].items():
+            if not tr["filled"]:
+                continue
+            ev = news_upcoming(tr["symbol"], t_now, NEWS_WARN_MIN)
+            if ev and f"newswarn_{key}_{ev}" not in state:
+                state[f"newswarn_{key}_{ev}"] = t_now
+                notify(f"⚠️ Annonce dans {max(1, (ev - t_now) // 60)} min : {display_name(tr['symbol'])} {tr['direction']} ouvert. "
+                       "Pense à sécuriser (SL au point d'entrée) ou à réduire.")
         # suivi des trades : remplissage, SL / TP2, expiration, purge
         lookup = lambda sym, tf: tf_candles(api, cache, sym, tf)
         done = tracker.resolve_pending(stats, lookup)

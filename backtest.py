@@ -29,7 +29,7 @@ def crt_setups(sym, series, t):
     if not htf["D1"] and not htf["H4"]:
         return []
     ltf = {tf: v for tf in CRT_CONF if (v := series[tf].view(t))}
-    return bot.analyze(sym, htf, ltf)
+    return bot.select_best(bot.analyze(sym, htf, ltf, now=t))
 
 
 def impulse_setups(sym, series, t):
@@ -106,8 +106,27 @@ def replay(strat, sym, hist, start_epoch):
     return trades
 
 
+COSTS = True   # --no-costs pour les désactiver
+
+
+def cost_r(tr):
+    """Coût aller-retour (spread + glissement estimés, bot.SPREAD_PCT / bot.SLIPPAGE_PCT) exprimé en R."""
+    risk = abs(tr["entry"] - tr["stop_loss"])
+    if not COSTS or risk <= 0:
+        return 0.0
+    return tr["entry"] * (bot.spread_pct(tr["symbol"]) + bot.SLIPPAGE_PCT) / 100 / risk
+
+
 def r_of(tr):
     return -1.0 if tr["result"] == "SL" else tr["risk_reward"]
+
+
+def r_net(tr):
+    return r_of(tr) - cost_r(tr)
+
+
+def r_managed_net(tr):
+    return tracker.managed_r(tr) - cost_r(tr)
 
 
 def group_line(name, trs, win):
@@ -115,19 +134,33 @@ def group_line(name, trs, win):
     if not res:
         return f"{name:<22} {len(trs):>4} setups, aucun résolu"
     wins = sum(1 for x in res if x["result"] == "TP")
-    line = (f"{name:<22} {len(trs):>4} setups | {len(res):>4} résolus | réussite {100*wins/len(res):5.1f}% "
-            f"| R moyen {sum(r_of(x) for x in res) / len(res):+.2f}")
+    n = len(res)
+    line = (f"{name:<22} {len(trs):>4} setups | {n:>4} résolus | réussite {100*wins/n:5.1f}% "
+            f"| R brut {sum(r_of(x) for x in res) / n:+.2f} | R net {sum(r_net(x) for x in res) / n:+.2f}")
     if win == "TP2":
-        line += f" | TP1 {100 * sum(1 for x in res if x['tp1_hit']) / len(res):5.1f}%"
+        line += (f" | TP1 {100 * sum(1 for x in res if x['tp1_hit']) / n:5.1f}%"
+                 f" | R géré net {sum(r_managed_net(x) for x in res) / n:+.2f}")
     return line
 
 
-def summary(strat, trades, days):
+def split_lines(strat, trades, days, oos):
+    """Stabilité dans le temps : même stratégie, première puis dernière partie de la période. Les paramètres
+    n'ont pas été ajustés sur la première partie : si les deux résultats divergent fortement, le résultat global est fragile."""
+    cut = time.time() - days * 86400 * oos
+    a = [x for x in trades if x["alert_epoch"] < cut]
+    b = [x for x in trades if x["alert_epoch"] >= cut]
+    return ["", f"Stabilité dans le temps (derniers {oos:.0%} de la période isolés)",
+            "  " + group_line("Première partie", a, strat["win"]), "  " + group_line("Dernière partie", b, strat["win"])]
+
+
+def summary(strat, trades, days, oos=0.0):
     win = strat["win"]
     if not trades:
         return "Aucun setup détecté sur la période."
     L = [f"BACKTEST {strat['label'].upper()} : {days} jours, {len(trades)} setups (gagnant = {win} atteint avant le SL)", ""]
     L.append(group_line("Global", trades, win))
+    if oos:
+        L += split_lines(strat, trades, days, oos)
     counts = {k: sum(1 for x in trades if x["result"] == k) for k in ("EXPIRE", "OUVERT", "EN_ATTENTE")}
     L.append(f"Non résolus : {counts['EXPIRE']} expirés (jamais remplis), {counts['OUVERT']} ouverts, "
              f"{counts['EN_ATTENTE']} en attente")
@@ -160,8 +193,9 @@ def summary(strat, trades, days):
                     reverse=True)
     for r, k, v in (ranked[:5] + ranked[-5:] if len(ranked) > 10 else ranked):
         L.append(f"  {k:<12} {len(v):>3} trades, R moyen {r:+.2f}")
-    L += ["", "Résultats théoriques : sans spread ni glissement, SL prioritaire si SL et cible touchés dans la",
-          "même bougie. Un backtest ne garantit rien pour la suite."]
+    L += ["", "Résultats théoriques : R net = R brut moins un coût estimé (spread + glissement, en R) ; SL prioritaire si SL et",
+          "cible touchés dans la même bougie ; R géré = moitié à TP1, SL au point d'entrée, reste vers TP2 (CRT). Un backtest",
+          "ne garantit rien pour la suite."]
     return "\n".join(L)
 
 
@@ -215,7 +249,7 @@ def run(api, strat, symbols, days, log=print):
 def compare(strat, by_mode):
     """Tableau comparatif des modes de tendance, sur le même historique."""
     L = ["COMPARAISON DES LECTURES DE TENDANCE (même historique)", ""]
-    L.append(f"{'mode':<12} {'setups':>6} {'résolus':>8} {'réussite':>9} {'R moyen':>8} {'somme R':>8}   contre-tendance")
+    L.append(f"{'mode':<12} {'setups':>6} {'résolus':>8} {'réussite':>9} {'R net moy':>8} {'somme R net':>8}   contre-tendance")
     for m, trs in by_mode.items():
         res = [x for x in trs if x["result"] in ("TP", "SL")]
         wins = sum(1 for x in res if x["result"] == "TP")
@@ -223,7 +257,7 @@ def compare(strat, by_mode):
         ct_txt = f"{len(ct)} trades, R moyen {sum(r_of(x) for x in ct) / len(ct):+.2f}" if ct else "aucun"
         if res:
             L.append(f"{m:<12} {len(trs):>6} {len(res):>8} {100 * wins / len(res):>8.1f}% "
-                     f"{sum(r_of(x) for x in res) / len(res):>+8.2f} {sum(r_of(x) for x in res):>+8.1f}   {ct_txt}")
+                     f"{sum(r_net(x) for x in res) / len(res):>+8.2f} {sum(r_net(x) for x in res):>+8.1f}   {ct_txt}")
         else:
             L.append(f"{m:<12} {len(trs):>6} {0:>8} {'-':>9} {'-':>8} {'-':>8}   {ct_txt}")
     if strat["label"] == "CRT":
@@ -242,7 +276,12 @@ def main():
     p.add_argument("--trend-mode", choices=list(bot.TREND_MODES) + ["all"], default=bot.TREND_MODE,
                    help="lecture de tendance : structure (précoce), deplacement (structure + cassure impulsive), "
                         "swings (3 swings + SMA 50) ou all (comparaison des trois)")
+    p.add_argument("--no-costs", action="store_true", help="ignore le spread et le glissement estimés (R brut = R net)")
+    p.add_argument("--oos", type=float, default=0.3,
+                   help="part finale de la période isolée pour juger la stabilité (0 pour désactiver, défaut 0,3)")
     a = p.parse_args()
+    global COSTS
+    COSTS = not a.no_costs
     strat = STRATEGIES[a.strategy]
     days = max(1, min(a.days, strat["max_days"]))
     if days != a.days:
@@ -262,7 +301,7 @@ def main():
         api.close()
     texts = []
     for m in modes:
-        t = summary(strat, by_mode[m], days)
+        t = summary(strat, by_mode[m], days, a.oos)
         texts.append(f"[tendance : {m}]\n{t}")
     if len(modes) > 1:
         texts.append(compare(strat, by_mode))
