@@ -19,6 +19,8 @@ jobs:
       NY_ALIGNED: ${{ vars.NY_ALIGNED }}
       CRT_BLOCK_COUNTER_TREND: ${{ vars.CRT_BLOCK_COUNTER_TREND }}
       CRT_REQUIRE_KILLZONE: ${{ vars.CRT_REQUIRE_KILLZONE }}
+      CRT_MODE: ${{ vars.CRT_MODE }}
+      CRT_STRICT_ENTRY: ${{ vars.CRT_STRICT_ENTRY }}
       CRT_REQUIRE_FVG: ${{ vars.CRT_REQUIRE_FVG }}
       CRT_REQUIRE_HTF_POI: ${{ vars.CRT_REQUIRE_HTF_POI }}
       CRT_NEWS_FILTER: ${{ vars.CRT_NEWS_FILTER }}

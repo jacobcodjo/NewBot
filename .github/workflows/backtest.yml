@@ -18,6 +18,16 @@ on:
           - swings
           - all
         default: structure
+      crt_mode:
+        description: "CRT : all (compare les 4 variantes), loose (mode historique), ote / mid / ote_confirm (CRT strict, C2 clôturée). Ignoré pour l'Impulsion"
+        type: choice
+        options:
+          - all
+          - loose
+          - ote
+          - mid
+          - ote_confirm
+        default: all
       days:
         description: "Durée rejouée en jours"
         default: "30"
@@ -30,7 +40,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -38,7 +48,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - run: python backtest.py --strategy "${{ github.event.inputs.strategy }}" --trend-mode "${{ github.event.inputs.trend_mode }}" --days "${{ github.event.inputs.days }}" --symbols "${{ github.event.inputs.symbols }}"
+      - run: python backtest.py --strategy "${{ github.event.inputs.strategy }}" --trend-mode "${{ github.event.inputs.trend_mode }}" --crt-mode "${{ github.event.inputs.crt_mode }}" --days "${{ github.event.inputs.days }}" --symbols "${{ github.event.inputs.symbols }}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
