@@ -8,6 +8,8 @@ le timeframe de confirmation, donc moins de cas SL/TP dans la même bougie qu'en
 
 Usage : python backtest.py [--strategy crt|impulse] [--days 30] [--symbols R_75,frxEURUSD] [--out fichier.csv]
         [--trend-mode structure|deplacement|swings|all]   (all : mêmes données rejouées avec les trois lectures de tendance)
+        [--crt-mode loose|ote|mid|ote_confirm|all]        (CRT : mode historique ou CRT strict avec l'entrée choisie ;
+                                                           all : compare les quatre sur le même historique)
 Limites : 5000 bougies par requête Deriv, soit 45 jours maximum en M15 (CRT) et 16 jours en M5 (Impulsion).
 Pas de spread, de commission ni de glissement. Gain compté sur la cible de gain entière : TP2 pour le CRT,
 TP1 pour l'Impulsion (-1 pour un SL). Alignement 17h NY ignoré. Les ordres limites de l'Impulsion
@@ -24,12 +26,15 @@ import tracker
 CRT_CONF = sorted({tf for l in bot.REFERENCE_CONFIRMATION_MAP.values() for tf in l})
 
 
+CRT_VARIANT = "loose"   # variante CRT rejouée : loose, ote, mid ou ote_confirm
+
+
 def crt_setups(sym, series, t):
     htf = {tf: series[tf].view(t) for tf in ("D1", "H4")}
     if not htf["D1"] and not htf["H4"]:
         return []
     ltf = {tf: v for tf in CRT_CONF if (v := series[tf].view(t))}
-    return bot.select_best(bot.analyze(sym, htf, ltf, now=t))
+    return bot.select_best(bot.analyze_variant(sym, htf, ltf, now=t, variant=CRT_VARIANT))
 
 
 def impulse_setups(sym, series, t):
@@ -153,17 +158,26 @@ def split_lines(strat, trades, days, oos):
             "  " + group_line("Première partie", a, strat["win"]), "  " + group_line("Dernière partie", b, strat["win"])]
 
 
-def summary(strat, trades, days, oos=0.0):
+def fill_stats(trades):
+    """(remplis, décidés) : un ordre est décidé quand il est rempli ou expiré ; les ordres encore en attente sont exclus."""
+    decided = [x for x in trades if x["result"] != "EN_ATTENTE"]
+    return sum(1 for x in decided if x["filled"]), len(decided)
+
+
+def summary(strat, trades, days, oos=0.0, label=None):
     win = strat["win"]
     if not trades:
         return "Aucun setup détecté sur la période."
-    L = [f"BACKTEST {strat['label'].upper()} : {days} jours, {len(trades)} setups (gagnant = {win} atteint avant le SL)", ""]
+    L = [f"BACKTEST {(label or strat['label']).upper()} : {days} jours, {len(trades)} setups (gagnant = {win} atteint avant le SL)", ""]
     L.append(group_line("Global", trades, win))
     if oos:
         L += split_lines(strat, trades, days, oos)
     counts = {k: sum(1 for x in trades if x["result"] == k) for k in ("EXPIRE", "OUVERT", "EN_ATTENTE")}
     L.append(f"Non résolus : {counts['EXPIRE']} expirés (jamais remplis), {counts['OUVERT']} ouverts, "
              f"{counts['EN_ATTENTE']} en attente")
+    filled, decided = fill_stats(trades)
+    if decided:
+        L.append(f"Taux de remplissage : {100 * filled / decided:.0f} % ({filled} ordres remplis sur {decided} décidés)")
     sections = [
         ("Classe d'actif", lambda x: tracker.asset_class(x["symbol"])),
         ("Référence", lambda x: x["ref_tf"]),
@@ -204,12 +218,12 @@ def write_csv(path, trades):
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["symbole", "reference", "confirmation", "sens", "ordre", "alerte_utc", "entree", "sl",
-                    "tp1", "tp2", "ratio_cible", "cible_de_gain", "tendance", "age_tendance", "zone", "ote", "mode_tendance", "contre_tendance", "resultat", "tp1_atteint",
+                    "tp1", "tp2", "ratio_cible", "cible_de_gain", "mode_crt", "tendance", "age_tendance", "zone", "ote", "mode_tendance", "contre_tendance", "resultat", "tp1_atteint",
                     "resolu_utc", "R"])
         for x in trades:
             w.writerow([x["symbol"], x["ref_tf"], x["confirmation_tf"], x["direction"], x["order_type"],
                         iso(x["alert_epoch"]), x["entry"], x["stop_loss"], x["tp1"], x["tp2"], x["risk_reward"],
-                        x["win_tp"].upper(), x.get("trend") or "", x.get("trend_age") or "", x.get("zone") or "",
+                        x["win_tp"].upper(), x.get("crt_mode", ""), x.get("trend") or "", x.get("trend_age") or "", x.get("zone") or "",
                         "" if x.get("ote") is None else int(bool(x["ote"])), x.get("trend_mode", ""), int(x["counter_trend"]), x["result"], int(x["tp1_hit"]),
                         iso(x.get("resolved_epoch")),
                         round(r_of(x), 2) if x["result"] in ("TP", "SL") else ""])
@@ -267,6 +281,55 @@ def compare(strat, by_mode):
     return "\n".join(L)
 
 
+def run_variants(api, strat, symbols, days, variants, log=print):
+    """Rejoue chaque symbole une fois par variante CRT (loose, ote, mid, ote_confirm), sur le même historique téléchargé
+    une seule fois. Retourne {variante: trades}."""
+    global CRT_VARIANT
+    start = int(time.time()) - days * 86400
+    original = CRT_VARIANT
+    out = {v: [] for v in variants}
+    try:
+        for n, sym in enumerate(symbols, 1):
+            hist = fetch_history(api, sym, days, strat["tfs"])
+            if not hist:
+                log(f"[{n}/{len(symbols)}] {sym} : historique indisponible, ignoré")
+                continue
+            counts = []
+            for v in variants:
+                CRT_VARIANT = v
+                got = replay(strat, sym, hist, start)
+                out[v] += got
+                counts.append(f"{v} {len(got)}")
+            log(f"[{n}/{len(symbols)}] {sym} : " + " | ".join(counts) + " setup(s)")
+    finally:
+        CRT_VARIANT = original
+    return out
+
+
+def compare_variants(by_variant):
+    """Tableau comparatif des variantes CRT : remplissage, réussite et R net, par trade et par alerte."""
+    L = ["COMPARAISON DES VARIANTES CRT (même historique, spread et glissement estimés déduits)", "",
+         f"{'variante':<12} {'alertes':>7} {'remplis':>8} {'résolus':>8} {'réussite':>9} {'R net/trade':>11} "
+         f"{'R géré net':>10} {'R net/alerte':>12}"]
+    for v, trs in by_variant.items():
+        res = [x for x in trs if x["result"] in ("TP", "SL")]
+        filled, decided = fill_stats(trs)
+        fill = f"{100 * filled / decided:.0f} %" if decided else "-"
+        if res:
+            wins = sum(1 for x in res if x["result"] == "TP")
+            L.append(f"{v:<12} {len(trs):>7} {fill:>8} {len(res):>8} {100 * wins / len(res):>8.1f}% "
+                     f"{sum(r_net(x) for x in res) / len(res):>+11.2f} "
+                     f"{sum(r_managed_net(x) for x in res) / len(res):>+10.2f} "
+                     f"{sum(r_net(x) for x in res) / len(trs):>+12.2f}")
+        else:
+            L.append(f"{v:<12} {len(trs):>7} {fill:>8} {0:>8} {'-':>9} {'-':>11} {'-':>10} {'-':>12}")
+    L += ["", "R net/trade : gain moyen d'un trade résolu. R net/alerte : somme des R nets divisée par TOUTES les alertes",
+          "(un ordre jamais rempli compte pour 0) : c'est la mesure qui permet de comparer des variantes dont le taux de",
+          "remplissage diffère. R géré net : moitié à TP1, SL au point d'entrée, reste vers TP2. Peu de trades = peu de",
+          "signification : compare aussi les deux moitiés de la période (--oos) avant de conclure."]
+    return "\n".join(L)
+
+
 def main():
     p = argparse.ArgumentParser(description="Backtest des stratégies CRT et Impulsion sur l'historique Deriv")
     p.add_argument("--strategy", choices=sorted(STRATEGIES), default="crt", help="crt (défaut) ou impulse")
@@ -276,6 +339,9 @@ def main():
     p.add_argument("--trend-mode", choices=list(bot.TREND_MODES) + ["all"], default=bot.TREND_MODE,
                    help="lecture de tendance : structure (précoce), deplacement (structure + cassure impulsive), "
                         "swings (3 swings + SMA 50) ou all (comparaison des trois)")
+    p.add_argument("--crt-mode", choices=list(bot.STRICT_ENTRIES) + ["loose", "all"], default=bot.current_variant(),
+                   help="CRT : loose (mode historique), ote / mid / ote_confirm (CRT strict, C2 clôturée) "
+                        "ou all (compare les quatre sur le même historique)")
     p.add_argument("--no-costs", action="store_true", help="ignore le spread et le glissement estimés (R brut = R net)")
     p.add_argument("--oos", type=float, default=0.3,
                    help="part finale de la période isolée pour juger la stabilité (0 pour désactiver, défaut 0,3)")
@@ -293,21 +359,39 @@ def main():
     if bot.NY_ALIGNED and a.strategy == "crt":
         print("NY_ALIGNED ignoré : le backtest utilise les bougies natives de Deriv.")
     out = a.out or f"backtest_{a.strategy}.csv"
-    modes = list(bot.TREND_MODES) if a.trend_mode == "all" else [a.trend_mode]
-    api = bot.Deriv()
-    try:
-        by_mode = run_modes(api, strat, symbols, days, modes)
-    finally:
-        api.close()
-    texts = []
-    for m in modes:
-        t = summary(strat, by_mode[m], days, a.oos)
-        texts.append(f"[tendance : {m}]\n{t}")
-    if len(modes) > 1:
-        texts.append(compare(strat, by_mode))
-    text = "\n\n".join(texts)
-    print("\n" + text)
-    write_csv(out, [x for m in modes for x in by_mode[m]])
+    global CRT_VARIANT
+    if a.strategy == "crt" and a.crt_mode == "all":
+        variants = ["loose"] + list(bot.STRICT_ENTRIES)
+        api = bot.Deriv()
+        try:
+            by_variant = run_variants(api, strat, symbols, days, variants)
+        finally:
+            api.close()
+        texts = [f"[{bot.variant_label(v)}]\n{summary(strat, by_variant[v], days, a.oos, label=bot.variant_label(v))}"
+                 for v in variants]
+        texts.append(compare_variants(by_variant))
+        text = "\n\n".join(texts)
+        print("\n" + text)
+        write_csv(out, [x for v in variants for x in by_variant[v]])
+    else:
+        if a.strategy == "crt":
+            CRT_VARIANT = a.crt_mode
+        modes = list(bot.TREND_MODES) if a.trend_mode == "all" else [a.trend_mode]
+        api = bot.Deriv()
+        try:
+            by_mode = run_modes(api, strat, symbols, days, modes)
+        finally:
+            api.close()
+        texts = []
+        label = bot.variant_label(CRT_VARIANT) if a.strategy == "crt" else None
+        for m in modes:
+            t = summary(strat, by_mode[m], days, a.oos, label=label)
+            texts.append(f"[tendance : {m}]\n{t}")
+        if len(modes) > 1:
+            texts.append(compare(strat, by_mode))
+        text = "\n\n".join(texts)
+        print("\n" + text)
+        write_csv(out, [x for m in modes for x in by_mode[m]])
     print(f"\nTrades détaillés : {out}")
     gh = os.getenv("GITHUB_STEP_SUMMARY")
     if gh:

@@ -51,7 +51,7 @@ def new_trade(setup, alert_epoch):
         "counter_trend": bool(setup.get("counter")),
         "trend": setup.get("trend"), "trend_age": setup.get("trend_age"),
         "zone": setup.get("zone"), "ote": t.get("ote"),
-        "alert_epoch": alert_epoch,
+        "alert_epoch": alert_epoch, "crt_mode": setup.get("mode", "loose"),
         "filled": market, "fill_epoch": alert_epoch if market else None,
         "tp1_hit": False, "be_hit": False,
         "rr_tp1": round(abs(t["tp1"] - t["entry"]) / abs(t["entry"] - t["sl"]), 2)

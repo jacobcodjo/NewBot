@@ -129,6 +129,29 @@ HTF_FVG_LOOKBACK = 30              # FVG non comblés cherchés sur les 30 derni
 HTF_FVG_TOL_ATR = 0.25             # tolérance autour de la zone (x ATR de la référence)
 REQUIRE_HTF_POI = _env_flag("CRT_REQUIRE_HTF_POI", False)   # True : le sweep doit se faire dans un FVG HTF (sinon : indication et priorité)
 
+# --- Mode CRT « strict » : C2 clôturée, entrée sur C2 pendant C3 ---
+# loose  : mode historique (sweep détecté en direct sur le TF de confirmation, entrée sur OB/FVG LTF)
+# strict : C1 = avant-dernière bougie de référence clôturée, C2 = dernière clôturée (a balayé un côté et clôturé dans le
+#          range de C1), C3 = bougie en formation. Entrée selon STRICT_ENTRY :
+#          ote         ordre limite au niveau STRICT_OTE_LEVEL du retracement de C2 (zone 62-79 %)
+#          mid         ordre limite à 50 % de C2
+#          ote_confirm zone OTE de C2 touchée, puis cassure de structure impulsive + OB/FVG sur le TF de confirmation
+STRICT_ENTRIES = ("ote", "mid", "ote_confirm")
+
+
+def _env_choice(name, default, allowed):
+    v = (os.getenv(name) or "").strip().lower()
+    return v if v in allowed else default
+
+
+CRT_MODE = _env_choice("CRT_MODE", "loose", ("loose", "strict"))
+STRICT_ENTRY = _env_choice("CRT_STRICT_ENTRY", "ote", STRICT_ENTRIES)
+STRICT_OTE_ZONE = (0.62, 0.79)     # zone OTE du retracement de C2 (part du range de C2, mesurée depuis l'extrême opposé au sweep)
+STRICT_OTE_LEVEL = 0.705           # niveau d'entrée de l'ordre limite dans la zone OTE
+STRICT_MID_LEVEL = 0.5
+STRICT_ENTRY_INSIDE_RANGE = True   # l'entrée doit rester dans le range de C1 (sinon : on entrerait au-delà du niveau balayé)
+STRICT_SL_BUFFER_ATR = 0.05        # marge du SL au-delà de l'extrême de C2 : max(STOP_LOSS_BUFFER_PCT, 0,05 ATR de la référence) + spread
+
 # --- Qualité de la confirmation ---
 MSS_REQUIRE_DISPLACEMENT = True    # la bougie qui casse la structure doit être impulsive (corps >= MSS_BODY_MULT x corps moyen)
 MSS_BODY_MULT = 1.2
@@ -727,7 +750,8 @@ def setup_keys(s):
     """Clés anti-doublon : un setup par range de référence, par TF de confirmation et par sens,
     plus un contrôle sur le contenu (mêmes niveaux = même message)."""
     t = s["trade"]
-    return (f"{s['sym']}_{s['ref_n']}_{s['ref_epoch']}_{s['conf_n']}_{s['dir']}",
+    mode = s.get("mode", "loose")
+    return (f"{s['sym']}_{s['ref_n']}_{s['ref_epoch']}_{s['conf_n']}_{s['dir']}" + ("" if mode == "loose" else f"_{mode}"),
             f"content_{s['sym']}_{s['dir']}_{round(t['entry'], 6)}_{round(t['sl'], 6)}_{round(t['tp2'], 6)}")
 
 
@@ -948,6 +972,181 @@ def analyze(sym, htf, ltf_by_tf, now=None):
     return setups
 
 
+def legacy_key(s, k_range):
+    """Ancien format de clé (avant l'ajout du sens), pour ne pas renvoyer un setup déjà alerté. Mode loose uniquement."""
+    return k_range.rsplit("_", 1)[0] if s.get("mode", "loose") == "loose" else None
+
+
+def current_variant():
+    """Variante CRT active : « loose » ou le mode d'entrée strict choisi (ote, mid, ote_confirm)."""
+    return "loose" if CRT_MODE == "loose" else STRICT_ENTRY
+
+
+def variant_label(v):
+    return {"loose": "CRT", "ote": "CRT strict · OTE de C2", "mid": "CRT strict · 50 % de C2",
+            "ote_confirm": "CRT strict · OTE de C2 + confirmation"}[v]
+
+
+def strict_candles(ref_n, htf, ny=False):
+    """(C1, C2, début de C3, C3) pour la référence. C2 = dernière bougie clôturée, C1 = celle d'avant, C3 = en formation.
+    W1 : semaines complètes agrégées depuis le D1 (C3 = D1 depuis la fin de C2). None si l'historique manque."""
+    if ref_n == "W1":
+        d1 = htf.get("D1")
+        wks = complete_weeks(d1, ny)
+        if len(wks) < 2:
+            return None
+        agg = lambda w: {"open": w[0]["open"], "high": max(c["high"] for c in w), "low": min(c["low"] for c in w),
+                         "close": w[-1]["close"], "epoch": w[-1]["epoch"]}
+        c1, c2 = agg(wks[-2]), agg(wks[-1])
+        start = c2["epoch"] + 86400
+        cur = [c for c in d1 if c["epoch"] >= start] or [d1[-1]]
+        c3 = {"epoch": start, "open": cur[0]["open"], "high": max(c["high"] for c in cur),
+              "low": min(c["low"] for c in cur), "close": cur[-1]["close"]}
+        return c1, c2, start, c3
+    cs = htf.get(ref_n)
+    if not cs or len(cs) < 4:
+        return None
+    return cs[-3], cs[-2], cs[-1]["epoch"], cs[-1]
+
+
+def build_strict_trade(sym, rng, c2, d, level, price, r_atr):
+    """Ordre limite à `level` du range de C2 (mesuré depuis l'extrême opposé au sweep), SL au-delà de l'extrême de C2,
+    TP1 au milieu de C1, TP2 au bord opposé de C1. None si le setup est ignoré."""
+    buy = d == "BUY"
+    size2 = c2["high"] - c2["low"]
+    if size2 <= 0:
+        return None
+    entry = (c2["high"] - level * size2) if buy else (c2["low"] + level * size2)
+    ext = c2["low"] if buy else c2["high"]
+    hi, lo = rng["high"], rng["low"]
+    if STRICT_ENTRY_INSIDE_RANGE and not lo < entry < hi:
+        return None
+    mid = (hi + lo) / 2
+    if REQUIRE_PREMIUM_DISCOUNT and ((entry > mid) if buy else (entry < mid)):
+        return None
+    buf = max(ext * STOP_LOSS_BUFFER_PCT / 100, STRICT_SL_BUFFER_ATR * r_atr) + ext * spread_pct(sym) / 100
+    extra = (hi - lo) * TP_EXTENSION_PCT / 100
+    if buy:
+        sl, tp1, tp2, tp3 = ext - buf, mid, hi, hi + extra
+    else:
+        sl, tp1, tp2, tp3 = ext + buf, mid, lo, lo - extra
+    if not ((sl < entry < tp2) if buy else (sl > entry > tp2)):
+        return None
+    rr = abs(tp2 - entry) / abs(entry - sl)
+    if rr < MIN_RISK_REWARD:
+        return None
+    pct = round(100 * level, 1)
+    how = f"OTE de C2 ({pct:g} %)" if level >= STRICT_OTE_ZONE[0] else f"{pct:g} % de C2"
+    return {"otype": order_type(d, entry, price), "entry": entry, "how": how, "sl": sl, "tp1": tp1, "tp2": tp2,
+            "tp3": tp3, "rr": rr, "ote": STRICT_OTE_ZONE[0] <= level <= STRICT_OTE_ZONE[1]}
+
+
+def analyze_strict(sym, htf, ltf_by_tf, now=None, entry=None):
+    """CRT strict : C2 clôturée dans le range de C1 après avoir balayé un seul côté ; entrée sur C2 pendant C3 (voir
+    STRICT_ENTRY). `entry` : ote, mid ou ote_confirm (défaut : STRICT_ENTRY)."""
+    now = time.time() if now is None else now
+    entry = entry or STRICT_ENTRY
+    if news_blackout(sym, now) or rollover_blackout(sym, now):
+        return []
+    info = trend_info(htf["D1"]) if htf.get("D1") else {"trend": None, "age": None}
+    trend = info["trend"]
+    ny = NY_ALIGNED and not is_247(sym)
+    setups = []
+    for ref_n, conf_list in REFERENCE_CONFIRMATION_MAP.items():
+        sc = strict_candles(ref_n, htf, ny)
+        if not sc:
+            continue
+        c1, c2, c3_start, c3 = sc
+        expires = c3_start + REF_GRAN[ref_n]   # fin de C3
+        if now > expires:
+            continue
+        rng = {"high": c1["high"], "low": c1["low"], "epoch": c1["epoch"]}
+        size, r_atr = rng["high"] - rng["low"], ref_atr(ref_n, htf, ny)
+        if size <= 0 or (r_atr and not RANGE_MIN_ATR * r_atr <= size <= RANGE_MAX_ATR * r_atr):
+            continue
+        swept_hi, swept_lo = c2["high"] > c1["high"], c2["low"] < c1["low"]
+        if swept_hi == swept_lo:
+            continue   # aucun sweep, ou les deux côtés (outside bar)
+        d = "SELL" if swept_hi else "BUY"
+        if not c1["low"] <= c2["close"] <= c1["high"]:
+            continue   # C2 n'a pas clôturé dans le range : vraie cassure
+        ext2 = c2["high"] if d == "SELL" else c2["low"]
+        depth = (c2["high"] - c1["high"]) if d == "SELL" else (c1["low"] - c2["low"])
+        if depth > SWEEP_MAX_RANGE_FRAC * size:
+            continue
+        conf_n = next((c for c in conf_list if ltf_by_tf.get(c) and len(ltf_by_tf[c]) >= 20), None)
+        if not conf_n:
+            continue   # pas de données récentes (marché fermé) : on ne place pas d'ordre
+        full = ltf_by_tf[conf_n]
+        ltf, price = full[:-1], full[-1]["close"]
+        after = [x for x in full if x["epoch"] >= c3_start]    # bougies de C3 (la dernière est en formation)
+        if any((x["high"] > ext2) if d == "SELL" else (x["low"] < ext2) for x in after + [c3]):
+            continue   # C3 a déjà dépassé l'extrême de C2 : la thèse est invalidée
+        counter = (trend == "bullish" and d == "SELL") or (trend == "bearish" and d == "BUY")
+        if BLOCK_COUNTER_TREND and counter:
+            continue
+        poi = htf_poi(ref_n, htf, d, ext2, r_atr)
+        if REQUIRE_HTF_POI and not poi:
+            continue
+        pools = find_liquidity_pools(ltf)
+        size2 = c2["high"] - c2["low"]
+        z1, z2 = STRICT_OTE_ZONE
+        zone = ((c2["low"] + z1 * size2, c2["low"] + z2 * size2) if d == "SELL"
+                else (c2["high"] - z2 * size2, c2["high"] - z1 * size2))
+        fvg = ob = None
+        if entry == "ote_confirm":
+            i0 = next((i for i, x in enumerate(ltf) if x["epoch"] >= c3_start
+                       and ((x["high"] >= zone[0]) if d == "SELL" else (x["low"] <= zone[1]))), None)
+            if i0 is None:
+                continue   # l'OTE de C2 n'a pas encore été touchée
+            w = STRUCTURE_SWING_WINDOW.get(conf_n, DEFAULT_STRUCTURE_SWING_WINDOW)
+            st = structure_shift(ltf, i0, d, w)
+            if not st:
+                continue
+            fvg, ob = detect_fvg(ltf, i0, st["j"], d), detect_order_block(ltf, st["j"], d, i0)
+            if not fvg and not ob:
+                continue
+            seg = ltf[i0:st["j"] + 1]
+            ext = max(x["high"] for x in seg) if d == "SELL" else min(x["low"] for x in seg)
+            sw = {"dir": d, "i": i0, "sl": ext, "range": rng, "closed": ltf, "fvg": fvg}
+            t = build_trade(sym, sw, {"j": st["j"], "m": ltf, "epoch": ltf[st["j"]]["epoch"]}, price, pools)
+            if t is None or is_stale(d, st["j"], t, full):
+                continue
+            if SKIP_MITIGATED and is_mitigated(d, st["j"], t["entry"], ltf):
+                continue
+            session = killzone(sym, ltf[i0]["epoch"])
+        else:
+            level = STRICT_OTE_LEVEL if entry == "ote" else STRICT_MID_LEVEL
+            t = build_strict_trade(sym, rng, c2, d, level, price, r_atr)
+            if t is None:
+                continue
+            k = max((i for i, x in enumerate(full) if x["epoch"] < c3_start), default=-1)
+            if is_stale(d, k, t, full) or is_stale(d, -1, t, [c3]):
+                continue   # SL ou TP1 déjà touchés pendant C3
+            if SKIP_MITIGATED and any((x["high"] >= t["entry"]) if d == "SELL" else (x["low"] <= t["entry"])
+                                      for x in after[:-1]):
+                continue   # l'entrée a déjà été touchée pendant C3 : l'ordre aurait été rempli avant l'alerte
+            session = killzone(sym, int(now))
+            sw = {"dir": d, "i": None, "sl": ext2, "range": rng, "closed": ltf, "fvg": None}
+        swept_pools = pools[0] if d == "SELL" else pools[1]
+        setups.append({
+            "sym": sym, "ref_n": ref_n, "conf_n": conf_n, "ref_epoch": c2["epoch"], "mode": entry,
+            "dir": d, "sw": sw, "fvg": fvg, "ob": ob, "trade": t, "ltf": ltf, "price": price, "session": session,
+            "grabbed": near_level(ext2, swept_pools), "counter": counter, "poi": poi,
+            "c2": c2, "ote_zone": zone, "expires": expires, "max_age": max(60, int(expires - now)),
+            "trend": trend, "trend_age": info["age"],
+        })
+    return setups
+
+
+def analyze_variant(sym, htf, ltf_by_tf, now=None, variant=None):
+    """Point d'entrée unique : mode historique (loose) ou CRT strict avec l'entrée choisie."""
+    variant = variant or current_variant()
+    if variant == "loose":
+        return analyze(sym, htf, ltf_by_tf, now=now)
+    return analyze_strict(sym, htf, ltf_by_tf, now=now, entry=variant)
+
+
 def entry_zone(m, j, d, lo=0, fvg=None):
     """Zone d'entrée au niveau de la cassure LTF (bougie j), par priorité :
     Order Block, sinon Breaker Block, sinon FVG (milieu). `lo` : indice du sweep (la zone doit lui être postérieure),
@@ -1121,7 +1320,7 @@ def crt_message(s, price, dec=None):
     c = lambda v: code(v, dec)
     t, sw, d, r = s["trade"], s["sw"], s["dir"], s["sw"]["range"]
     lines = [
-        f"{'🟢' if d == 'BUY' else '🔴'} {t['otype']} · {display_name(s['sym'])} · {s['conf_n']} · CRT",
+        f"{'🟢' if d == 'BUY' else '🔴'} {t['otype']} · {display_name(s['sym'])} · {s['conf_n']} · {variant_label(s.get('mode', 'loose'))}",
         f"Session : {s['session'] or 'hors killzone'}", "",
         "────────────────", f"Prix actuel  {c(price)}", "────────────────", "",
         f"Entrée  {c(t['entry'])}  ({t['how']})",
@@ -1132,6 +1331,9 @@ def crt_message(s, price, dec=None):
         f"Range {s['ref_n']}  {c(r['low'])} - {c(r['high'])}",
         f"✅ Sweep  {c(sw['sl'])}",
     ]
+    if s.get("c2"):
+        lines.append("✅ C2 clôturée dans le range de C1")
+        lines.append(f"OTE de C2  {c(s['ote_zone'][0])} - {c(s['ote_zone'][1])}")
     if s["fvg"]:
         lines.append(f"✅ FVG  {c(s['fvg']['bottom'])} - {c(s['fvg']['top'])}")
     if s["ob"]:
@@ -1189,10 +1391,10 @@ def main():
                 cs = tf_candles(api, cache, sym, tf)
                 if cs and time.time() - cs[-1]["epoch"] <= 3 * GRAN[tf]:  # sinon : marché fermé
                     ltf_by_tf[tf] = cs
-            for s in select_best(analyze(sym, htf, ltf_by_tf)):
+            for s in select_best(analyze_variant(sym, htf, ltf_by_tf)):
                 k_range, k_content = setup_keys(s)
-                legacy = k_range.rsplit("_", 1)[0]   # ancien format de clé (sans le sens) : évite de renvoyer un setup déjà alerté
-                if k_range in state or k_content in state or legacy in state:
+                legacy = legacy_key(s, k_range)   # ancien format de clé (sans le sens) : évite de renvoyer un setup déjà alerté
+                if k_range in state or k_content in state or (legacy and legacy in state):
                     continue
                 gate = risk_gate(stats, int(time.time()))
                 if gate:

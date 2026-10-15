@@ -95,6 +95,22 @@ Stratégie et liste d'actifs reprises de l'ancien Crt-Bot. Le client Deriv, le c
 
 Le CRT ne dépend plus des cascades à trois niveaux (`CASCADES`), qui restent dans `bot.py` pour l'Impulsion. Les garde-fous ajoutés après l'analyse du bot (validation de C2, déplacement, FVG/OB stricts, premium/discount, news, SL adaptatif) sont tous des constantes de `bot.py` : chacun se désactive en une ligne. Ils n'ont pas été validés sur l'historique Deriv : lance le backtest avant de t'y fier.
 
+## CRT strict : C2 clôturée, entrée sur C2 (`CRT_MODE`)
+
+Le mode historique (`loose`) entre pendant la formation de C2, dès qu'un sweep, une cassure de structure et un OB/FVG sont confirmés sur le timeframe de confirmation. Le mode **strict** suit le modèle de base à 3 bougies : **C1** est l'avant-dernière bougie de référence clôturée, **C2** la dernière clôturée et **C3** la bougie en formation. Il s'active avec la variable de dépôt `CRT_MODE=strict`, et le mode d'entrée se choisit avec `CRT_STRICT_ENTRY` (défaut : `ote`).
+
+Conditions communes : C2 balaie **un seul** côté de C1 (pas d'outside bar), **clôture dans** le range de C1, sa mèche ne dépasse pas la profondeur maximale (`SWEEP_MAX_RANGE_FRAC`), et C3 n'a pas dépassé l'extrême de C2 (sinon la thèse est invalidée). Le range de C1 doit mesurer entre 0,6 et 2,5 ATR (`RANGE_MIN_ATR`, `RANGE_MAX_ATR`). TP1 est au milieu de C1, TP2 à son bord opposé, et l'ordre expire à la fin de C3. Les filtres communs s'appliquent aussi (annonces, rollover, premium/discount, corrélation, limites de risque, zone d'intérêt HTF).
+
+| `CRT_STRICT_ENTRY` | Entrée | Stop-loss |
+| --- | --- | --- |
+| `ote` | Ordre limite à 70,5 % du retracement de C2 (zone OTE 62-79 %, mesurée depuis l'extrême opposé au sweep : une vente est placée près du haut de C2) | Au-delà de l'extrême de C2, marge de 0,05 ATR de la référence plus le spread |
+| `mid` | Ordre limite à 50 % de C2 | Idem |
+| `ote_confirm` | La zone OTE de C2 est touchée pendant C3, puis une cassure de structure impulsive et un OB ou FVG sur le timeframe de confirmation donnent l'entrée (même moteur que le mode historique) | Au-delà du plus haut (ou bas) du retracement, avec la marge adaptative habituelle |
+
+Particularités des deux ordres limites : l'entrée doit rester dans le range de C1 (`STRICT_ENTRY_INSIDE_RANGE`) et du bon côté du milieu (premium pour une vente, discount pour un achat), sinon le setup est ignoré ; si l'entrée a déjà été touchée pendant C3, l'alerte est ignorée (l'ordre aurait été rempli avant). Le R:R minimum (3) s'applique : à 50 %, le stop est plus loin et beaucoup de setups tombent sous ce seuil.
+
+**Limite à connaître :** les ordres limites ne sont remplis que si le prix retrace vers l'entrée. Les expansions de C3 les plus fortes ne reviennent souvent jamais : le taux de remplissage peut être faible et le résultat dépend alors des seuls retracements. Le backtest compare les quatre variantes avec le taux de remplissage et le R net **par alerte** (un ordre jamais rempli compte pour 0), seule mesure qui permet de les comparer équitablement : `python backtest.py --crt-mode all` ou, sur GitHub, le champ « crt_mode » du workflow (valeur par défaut `all`). Réglages : `STRICT_OTE_ZONE`, `STRICT_OTE_LEVEL`, `STRICT_MID_LEVEL`, `STRICT_SL_BUFFER_ATR`.
+
 ## Suivi automatique des trades (`tracker.py`)
 
 Chaque alerte est enregistrée dans un fichier de statistiques par stratégie : `trade_stats.json` pour le CRT, `trade_stats_impulse.json` pour l'Impulsion (conservés par le cache du workflow, comme `state.json`).
@@ -110,6 +126,7 @@ Le script rejoue l'historique Deriv comme le bot l'aurait vu : à chaque clôtur
 
 - **Sur GitHub :** Actions → CRT Backtest → Run workflow, avec la stratégie (`crt` ou `impulse`), la durée en jours et, si besoin, des symboles séparés par des virgules (par exemple `frxEURUSD,cryBTCUSD` pour le CRT, `R_75,1HZ100V` pour l'Impulsion ; un symbole d'une autre stratégie est refusé). Le résumé s'affiche dans la page de l'exécution et le fichier `backtest_crt.csv` ou `backtest_impulse.csv` (avec les colonnes `tendance`, `age_tendance`, `zone`, `ote` et `mode_tendance`) est téléchargeable dans les artefacts. Le backtest complet des 11 actifs du CRT est rapide, celui des 18 indices de l'Impulsion prend plus de temps (pas de 5 minutes).
 - **Lecture de tendance :** `--trend-mode structure` (défaut), `deplacement`, `swings`, ou `all`, qui rejoue le même historique avec les trois règles et affiche un tableau comparatif (setups, réussite, R moyen, contre-tendance). Le résumé de chaque mode contient un tableau par âge de tendance, et selon la stratégie un tableau par zone de retracement (Impulsion : Golden Zone 50-61,8 % contre OTE 61,8-79 %) ou selon que l'entrée tombe dans l'OTE ou non (CRT). Pour le CRT, la tendance n'est qu'une étiquette : seuls les résultats « contre-tendance » changent. Pour l'Impulsion, c'est un filtre : le nombre de setups change. Sur GitHub, c'est le champ « trend_mode » du workflow.
+- **Variantes CRT :** `--crt-mode loose|ote|mid|ote_confirm|all` (défaut : la variante active du bot). `all` rejoue le même historique avec le mode historique et les trois entrées du CRT strict, puis affiche un tableau comparatif : alertes, taux de remplissage, réussite, R net par trade, R géré net et **R net par alerte**. Le CSV contient une colonne `mode_crt`.
 - **En local :** `python backtest.py --strategy impulse --days 14 --symbols R_75,1HZ100V --trend-mode all`
 - **Résultat :** réussite et R moyen (SL = -1, gain = ratio de la cible : TP2 pour le CRT, TP1 pour l'Impulsion), plus TP1 atteint pour le CRT, globalement puis par classe d'actif, référence, tendance (CRT), type d'ordre et sens, plus les meilleurs et pires symboles (5 trades minimum).
 - **Limites :** 5000 bougies par requête Deriv, soit 45 jours au maximum pour le CRT (M15) et 16 jours pour l'Impulsion (M5) : une durée plus longue est ramenée à ce maximum. Le **R net** retranche un coût estimé (spread de `SPREAD_PCT` plus glissement de `SLIPPAGE_PCT`, exprimé en R) ; `--no-costs` le désactive. Pas de commission ni de swap. `--oos 0.3` (défaut) isole les 30 % finaux de la période pour juger la stabilité dans le temps (`--oos 0` pour désactiver) : les paramètres n'étant pas ajustés sur la première partie, un écart important entre les deux signale un résultat fragile. Les bougies D1 et H4 sont celles de Deriv (`NY_ALIGNED` est ignoré). Les marchés fermés suivent la même règle qu'en direct. Un backtest sur quelques semaines n'est pas statistiquement concluant et ne garantit rien pour la suite.
@@ -253,6 +270,7 @@ Chaque TP affiche son ratio gain/risque, calculé depuis l'entrée prévue (le f
 | `tracker.py` | `PENDING_MAX_AGE_DAYS`, `TRADE_MAX_OPEN_DAYS`, `TRADE_HISTORY_MAX_AGE_DAYS` | Expiration des ordres CRT jamais remplis, trade ouvert trop longtemps, durée de l'historique |
 | `bot.py` | `CASCADES` | Triplets de timeframes (utilisés par `impulse.py`, plus par le CRT) |
 | `bot.py` | `STOP_LOSS_BUFFER_PCT`, `STOP_LOSS_BUFFER_ATR`, `SPREAD_PCT`, `SLIPPAGE_PCT` | Marge du SL (% du prix, ATR), spread estimé, glissement estimé (backtest) |
+| `bot.py` | `CRT_MODE`, `STRICT_ENTRY`, `STRICT_OTE_ZONE`, `STRICT_OTE_LEVEL`, `STRICT_MID_LEVEL`, `STRICT_ENTRY_INSIDE_RANGE`, `STRICT_SL_BUFFER_ATR` | CRT strict (C2 clôturée) : mode, entrée, zone OTE, marge du SL (variables de dépôt `CRT_MODE`, `CRT_STRICT_ENTRY`) |
 | `bot.py` | `REQUIRE_C2_CLOSE_INSIDE` | Valide que C2 finit dans le range de C1 |
 | `bot.py` | `SWEEP_MAX_RANGE_FRAC`, `SWEEP_MAX_ATR`, `SWEEP_MAX_AGE`, `SKIP_BOTH_SIDES_SWEPT` | Profondeur, fraîcheur et côté unique du sweep |
 | `bot.py` | `RANGE_MIN_ATR`, `RANGE_MAX_ATR` | Taille acceptée du range de C1 (en ATR de la référence) |
@@ -286,7 +304,7 @@ Chaque TP affiche son ratio gain/risque, calculé depuis l'entrée prévue (le f
 
 ## Tests
 
-`python -m unittest discover -s tests -v` (à la racine du dépôt, sans accès réseau) rejoue des scénarios synthétiques : setup valide, puis un rejet par garde-fou (C2 hors range, clôture hors range, cassure peu impulsive, sweep trop profond ou ancien, deux côtés balayés, range hors normes, entrée déjà retestée, expiration, premium/discount, zone d'intérêt HTF), le filtre d'annonces (NFP) et de rollover, les limites de risque, le calcul de taille, le suivi avec break-even et un passage complet de `main()` avec une API simulée. Le workflow « CRT Tests » les lance sur GitHub. Ils vérifient la logique, pas la rentabilité : seul le backtest et le suivi en direct renseignent là-dessus.
+`python -m unittest discover -s tests -v` (à la racine du dépôt, sans accès réseau) rejoue des scénarios synthétiques (mode historique et CRT strict) : setup valide, puis un rejet par garde-fou (C2 hors range, clôture hors range, cassure peu impulsive, sweep trop profond ou ancien, deux côtés balayés, range hors normes, entrée déjà retestée, expiration, premium/discount, zone d'intérêt HTF), le filtre d'annonces (NFP) et de rollover, les limites de risque, le calcul de taille, le suivi avec break-even et un passage complet de `main()` avec une API simulée. Le workflow « CRT Tests » les lance sur GitHub. Ils vérifient la logique, pas la rentabilité : seul le backtest et le suivi en direct renseignent là-dessus.
 
 ## Dépannage
 
