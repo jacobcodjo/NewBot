@@ -3,8 +3,9 @@ Références W1 / D1 / H4 : sweep de liquidité sur un TF de confirmation propor
 cassure de structure + FVG et/ou Order Block. 11 actifs (forex majeurs, or, cryptos).
 Données : API websocket Deriv | Alertes : Telegram
 """
-import json, os, random, time
-from datetime import datetime, timedelta, timezone
+import hashlib, json, os, random, time
+from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
 from zoneinfo import ZoneInfo
 import requests
 import websocket  # websocket-client
@@ -144,13 +145,33 @@ def _env_choice(name, default, allowed):
     return v if v in allowed else default
 
 
-CRT_MODE = _env_choice("CRT_MODE", "loose", ("loose", "strict"))
+CRT_MODE = _env_choice("CRT_MODE", "loose", ("loose", "strict", "session"))
 STRICT_ENTRY = _env_choice("CRT_STRICT_ENTRY", "ote", STRICT_ENTRIES)
 STRICT_OTE_ZONE = (0.62, 0.79)     # zone OTE du retracement de C2 (part du range de C2, mesurée depuis l'extrême opposé au sweep)
 STRICT_OTE_LEVEL = 0.705           # niveau d'entrée de l'ordre limite dans la zone OTE
 STRICT_MID_LEVEL = 0.5
 STRICT_ENTRY_INSIDE_RANGE = True   # l'entrée doit rester dans le range de C1 (sinon : on entrerait au-delà du niveau balayé)
 STRICT_SL_BUFFER_ATR = 0.05        # marge du SL au-delà de l'extrême de C2 : max(STOP_LOSS_BUFFER_PCT, 0,05 ATR de la référence) + spread
+
+# --- Mode CRT « sessions » (forex et or) : Asie = accumulation, Londres = manipulation, New York = distribution ---
+# C1 = range de la session asiatique ; C2 = balayage de ce range pendant la session de Londres, puis retour dans le range ;
+# C3 = distribution pendant la session de New York. Entrée sur cassure de structure impulsive + OB/FVG au TF de confirmation.
+# Horaires (CRT_SESSION_SCHEDULE) :
+#   normal   : sessions réelles du forex, avec leurs changements d'heure (Londres, New York) :
+#              Asie  = ouverture de Tokyo (00h00 UTC) -> ouverture de Londres (8h00 Londres)
+#              Londres = 8h00 Londres -> ouverture de New York (8h00 New York)
+#              New York = 8h00 -> 17h00 New York
+#   killzone : fenêtres ICT : Asie 20h-00h, Londres 2h-5h, New York 7h-12h (heure de New York)
+#   mixed    : range sur toute la session de Tokyo (00h00 UTC jusqu'à 2h00 New York), sweep pendant la killzone de Londres
+#              (2h-5h New York), distribution pendant la killzone de New York (7h-12h) ; l'ordre expire à 12h New York
+SESSION_SCHEDULE = _env_choice("CRT_SESSION_SCHEDULE", "normal", ("normal", "killzone", "mixed"))
+LONDON = ZoneInfo("Europe/London")
+SESSION_MIN_COVERAGE = 0.6         # part minimale de bougies de la session asiatique disponibles (sinon : range non fiable)
+SESSION_RANGE_MIN_ATR_D1 = 0.15    # range asiatique inférieur à 0,15 ATR D1 : bruit
+SESSION_RANGE_MAX_ATR_D1 = 0.70    # ... supérieur à 0,7 ATR D1 : la journée a déjà bougé
+SESSION_SWEEP_MAX_RANGE_FRAC = 1.0 # profondeur maximale du sweep londonien (part du range asiatique)
+SESSION_SWEEP_MAX_ATR_D1 = 0.40    # ... et en ATR D1
+SESSION_LABELS = {"asia": "Asie", "london": "Londres", "newyork": "New York"}
 
 # --- Qualité de la confirmation ---
 MSS_REQUIRE_DISPLACEMENT = True    # la bougie qui casse la structure doit être impulsive (corps >= MSS_BODY_MULT x corps moyen)
@@ -179,12 +200,46 @@ ROLLOVER_NY = (16 * 60 + 45, 17 * 60 + 30)   # fenêtre en minutes depuis minuit
 NEWS_FILE = "news.json"            # facultatif : [{"time": "2026-11-04T19:00:00Z", "currencies": ["USD"]}, ...] (FOMC, CPI, BCE...)
 # Le NFP (premier vendredi du mois, 8h30 New York) est ajouté automatiquement.
 
+# --- Jours fériés (forex et or) : liquidité atypique, pas d'alerte ---
+HOLIDAY_FILTER = _env_flag("CRT_HOLIDAY_FILTER", True)
+HOLIDAYS_FILE = "holidays.json"    # facultatif : ["2026-12-24", {"date": "2027-01-04", "name": "Tokyo"}] (jour entier, date UTC)
+
+# --- Flux d'annonces (facultatif, non testé contre le service réel) ---
+NEWS_FEED = _env_flag("CRT_NEWS_FEED", False)   # True : annonces à fort impact lues dans le calendrier économique public
+NEWS_FEED_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+NEWS_FEED_TTL = 6 * 3600           # relecture au plus toutes les 6 h (le service limite les requêtes)
+
+# --- Obstacles entre l'entrée et TP2 ---
+# off  : rien ; flag : l'alerte signale les obstacles (PDH/PDL, PWH/PWL, FVG D1 opposés non comblés) ;
+# cap  : TP2 plafonné au premier obstacle situé après TP1 (le ratio minimum s'applique), setup ignoré si un obstacle
+#        se trouve avant TP1
+OBSTACLE_MODE = _env_choice("CRT_OBSTACLE_MODE", "flag", ("off", "flag", "cap"))
+OBSTACLE_MARGIN = 0.03             # les niveaux à moins de 3 % de la distance entrée-TP2 de l'entrée ou de TP2 sont ignorés
+
+# --- Surveillance ---
+def _heartbeat_hour():
+    v = (os.getenv("CRT_HEARTBEAT_HOUR") or "").strip().lower()
+    if v in ("off", "non", "-1", "false", "0 off"):
+        return None
+    return int(v) if v.isdigit() and 0 <= int(v) <= 23 else 6
+
+
+HEARTBEAT_HOUR_UTC = _heartbeat_hour()   # message « bot actif » une fois par jour à partir de cette heure UTC (off : désactivé)
+ERROR_REPEAT_HOURS = 6             # une même erreur n'est renvoyée qu'après 6 h
+TRADE_NOTIFICATIONS = _env_flag("CRT_TRADE_NOTIFICATIONS", True)   # ordre rempli, TP1 atteint (sécuriser), trade clos
+
+# --- Exécution et risque ---
+SPREAD_SCALE = _env_float("CRT_SPREAD_SCALE", 1.0)   # multiplicateur des spreads estimés (à caler sur ton courtier)
+LOT_UNITS = {"frxXAU": 100, "frx": 100000, "cry": 1}   # unités par lot (vérifie le contrat de ton courtier)
+COUNT_PROTECTED_TRADES = False     # False : un trade qui a atteint TP1 est supposé sécurisé (SL au point d'entrée) et n'est plus compté
+PRICE_FEED_NOTE = True             # une fois par jour, rappelle que les niveaux viennent du flux Deriv
+
 # --- Risque ---
 ACCOUNT_BALANCE = _env_float("ACCOUNT_BALANCE", 0.0)   # capital (variable de dépôt) : active la ligne « Taille » des alertes
 RISK_PCT = _env_float("RISK_PCT", 1.0)                 # risque par trade (% du capital)
 MAX_DAILY_LOSS_R = 3.0             # alertes suspendues si les trades résolus du jour (R géré) cumulent -3 R ou moins
 MAX_WEEKLY_LOSS_R = 6.0            # ... ou -6 R sur la semaine
-MAX_OPEN_TRADES = 6                # plafond global de trades suivis (en attente ou ouverts)
+MAX_OPEN_TRADES = 6                # plafond global de trades suivis non sécurisés (en attente ou ouverts)
 MAX_CORRELATED_OPEN = 2            # trades déjà ouverts/en attente sur le même côté d'un groupe corrélé (USD, cryptos)
 CORRELATION_MODE = os.getenv("CRT_CORRELATION_MODE", "flag")   # flag : avertissement | block : alerte retenue tant que l'exposition est pleine
 MANAGEMENT_NOTE = True             # ajoute la règle de gestion après TP1 (moitié à TP1, SL au point d'entrée)
@@ -419,27 +474,90 @@ def ref_atr(ref_n, htf, ny=False):
     return _atr_before(cs, len(cs) - 1) if cs and len(cs) > 3 else 0.0
 
 
+def unfilled_fvgs(closed, lookback=None):
+    """FVG non comblés des `lookback` dernières bougies clôturées, le plus récent d'abord : (sens, bas, haut), sens
+    « up » = haussier (demande), « down » = baissier (offre). Comblé = une clôture ultérieure a traversé toute la zone."""
+    lookback = lookback or HTF_FVG_LOOKBACK
+    out = []
+    for i in range(len(closed) - 2, max(1, len(closed) - lookback) - 1, -1):
+        c1, c3 = closed[i - 1], closed[i + 1]
+        if c1["high"] < c3["low"]:
+            kind, bottom, top = "up", c1["high"], c3["low"]
+        elif c1["low"] > c3["high"]:
+            kind, bottom, top = "down", c3["high"], c1["low"]
+        else:
+            continue
+        if any((c["close"] < bottom) if kind == "up" else (c["close"] > top) for c in closed[i + 2:]):
+            continue
+        out.append((kind, bottom, top))
+    return out
+
+
 def htf_poi(ref_n, htf, d, ext, atr):
     """Le sweep (extrême ext) se fait-il dans un FVG HTF non comblé ? Achat : FVG haussier (demande) ; vente : baissier.
     FVG cherchés sur la référence (D1 pour le W1), avant la bougie en formation."""
     cs = htf.get("D1" if ref_n == "W1" else ref_n)
     if not cs or len(cs) < 6:
         return None
-    closed, tol, up = cs[:-1], HTF_FVG_TOL_ATR * atr, d == "BUY"
-    for i in range(len(closed) - 2, max(0, len(closed) - HTF_FVG_LOOKBACK) - 1, -1):
-        c1, c3 = closed[i - 1], closed[i + 1]
-        if up and c1["high"] < c3["low"]:
-            bottom, top = c1["high"], c3["low"]
-        elif not up and c1["low"] > c3["high"]:
-            bottom, top = c3["high"], c1["low"]
-        else:
-            continue
-        later = closed[i + 2:]
-        if any((c["close"] < bottom) if up else (c["close"] > top) for c in later):
-            continue  # comblé : une clôture a traversé toute la zone
-        if bottom - tol <= ext <= top + tol:
+    tol, up = HTF_FVG_TOL_ATR * atr, d == "BUY"
+    for kind, bottom, top in unfilled_fvgs(cs[:-1]):
+        if (kind == "up") == up and bottom - tol <= ext <= top + tol:
             return {"bottom": bottom, "top": top}
     return None
+
+
+def htf_levels(htf, ny, d):
+    """Niveaux susceptibles d'arrêter le prix : plus haut/bas de la veille (PDH, PDL) et de la semaine précédente
+    (PWH, PWL), et bord proche des FVG D1 non comblés opposés au trade (vente : demande ; achat : offre)."""
+    d1 = htf.get("D1")
+    if not d1 or len(d1) < 3:
+        return []
+    closed = d1[:-1]
+    out = [("PDH", closed[-1]["high"]), ("PDL", closed[-1]["low"])]
+    wks = complete_weeks(d1, ny)
+    if wks:
+        out += [("PWH", max(c["high"] for c in wks[-1])), ("PWL", min(c["low"] for c in wks[-1]))]
+    for kind, bottom, top in unfilled_fvgs(closed):
+        if d == "SELL" and kind == "up":
+            out.append(("FVG D1", top))
+        elif d == "BUY" and kind == "down":
+            out.append(("FVG D1", bottom))
+    return out
+
+
+def find_obstacles(d, t, levels):
+    """Niveaux situés entre l'entrée et TP2 (hors marge autour de l'entrée et de TP2), du plus proche au plus lointain."""
+    entry, tp2 = t["entry"], t["tp2"]
+    m = OBSTACLE_MARGIN * abs(tp2 - entry)
+    obs = {(n, L) for n, L in levels if ((tp2 < L < entry) if d == "SELL" else (entry < L < tp2))
+           and abs(L - entry) > m and abs(L - tp2) > m}
+    return sorted(obs, key=lambda o: abs(o[1] - entry))
+
+
+def with_obstacles(d, t, htf, ny=False):
+    """Applique OBSTACLE_MODE : off ; flag (obstacles notés dans t['obstacles']) ; cap (TP2 plafonné au premier obstacle
+    situé après TP1, ancien TP2 repoussé en TP3 ; None si un obstacle précède TP1 ou si le ratio tombe sous le minimum)."""
+    if OBSTACLE_MODE == "off":
+        return t
+    obs = find_obstacles(d, t, htf_levels(htf, ny, d))
+    t["obstacles"] = obs
+    risk = abs(t["entry"] - t["sl"])
+    if obs and risk > 0:
+        t["obstacle_rr"] = abs(obs[0][1] - t["entry"]) / risk
+    if OBSTACLE_MODE != "cap" or not obs:
+        return t
+    m = OBSTACLE_MARGIN * abs(t["tp2"] - t["entry"])
+    pos = lambda L: (t["entry"] - L) if d == "SELL" else (L - t["entry"])   # progression vers la cible
+    p1 = pos(t["tp1"])
+    if any(pos(L) < p1 - m for _, L in obs):
+        return None   # un obstacle se dresse avant TP1
+    beyond = [(n, L) for n, L in obs if pos(L) > p1 + m]
+    if not beyond:
+        return t
+    name, level = beyond[0]
+    t["tp3"], t["tp2"], t["tp2_cap"] = t["tp2"], level, name
+    t["rr"] = abs(level - t["entry"]) / risk
+    return t if t["rr"] >= MIN_RISK_REWARD else None
 
 
 def ref_range(ref_n, htf, ny=False):
@@ -759,7 +877,7 @@ def spread_pct(sym):
     """Spread estimé (% du prix) : préfixe le plus long de SPREAD_PCT (frxXAU avant frx), 0 sinon."""
     for k in sorted(SPREAD_PCT, key=len, reverse=True):
         if sym.startswith(k):
-            return SPREAD_PCT[k]
+            return SPREAD_PCT[k] * SPREAD_SCALE
     return 0.0
 
 
@@ -793,6 +911,53 @@ def nfp_events(epoch):
     return out
 
 
+def _all_news_events(epoch):
+    """Annonces connues : NFP automatique, fichier NEWS_FILE, flux économique (si NEWS_FEED)."""
+    return _news_file_events() + _NEWS_CACHE.get("feed", []) + nfp_events(epoch)
+
+
+def parse_news_feed(data):
+    """Événements à fort impact du calendrier économique : liste de [epoch, devise]. Entrées invalides ignorées."""
+    out = []
+    for e in data if isinstance(data, list) else []:
+        try:
+            if str(e.get("impact", "")).strip().lower() != "high":
+                continue
+            dt = datetime.fromisoformat(str(e["date"]).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            cur = str(e.get("country", "")).strip().upper()
+            if cur:
+                out.append([dt.timestamp(), cur])
+        except Exception:
+            continue
+    return out
+
+
+def _fetch_news_feed():
+    r = requests.get(NEWS_FEED_URL, timeout=10, headers={"User-Agent": "crt-bot"})
+    r.raise_for_status()
+    return r.json()
+
+
+def refresh_news_feed(cache, now=None):
+    """Charge le flux d'annonces dans le cache (relecture toutes les NEWS_FEED_TTL secondes ; en cas d'échec, on garde
+    les événements connus et on réessaie dans 30 minutes)."""
+    if not NEWS_FEED:
+        _NEWS_CACHE["feed"] = []
+        return
+    now = time.time() if now is None else now
+    fd = cache.get("news_feed") or {}
+    if now - fd.get("fetched", 0) > NEWS_FEED_TTL:
+        try:
+            fd = {"fetched": now, "events": parse_news_feed(_fetch_news_feed())}
+        except Exception as e:
+            print(f"Flux d'annonces indisponible ({type(e).__name__}) : événements précédents conservés.")
+            fd = {"fetched": now - NEWS_FEED_TTL + 1800, "events": fd.get("events", [])}
+        cache["news_feed"] = fd
+    _NEWS_CACHE["feed"] = [(ts, {cur}) for ts, cur in fd.get("events", [])]
+
+
 def news_blackout(sym, epoch):
     """True si `epoch` tombe dans la fenêtre d'une annonce concernant une devise du symbole (forex et or)."""
     return bool(NEWS_FILTER and _news_hit(sym, epoch, NEWS_BLOCK_BEFORE_MIN * 60, NEWS_BLOCK_AFTER_MIN * 60))
@@ -811,7 +976,7 @@ def _news_hit(sym, epoch, before_s, after_s):
     ccy = _news_ccy(sym)
     if not ccy:
         return None
-    for ts, cur in _news_file_events() + nfp_events(epoch):
+    for ts, cur in _all_news_events(epoch):
         if cur & ccy and ts - before_s <= epoch <= ts + after_s:
             return ts
     return None
@@ -820,10 +985,98 @@ def _news_hit(sym, epoch, before_s, after_s):
 def news_upcoming(sym, epoch, minutes):
     """Annonce touchant le symbole dans les `minutes` à venir (epoch de l'annonce) ou None."""
     ccy = _news_ccy(sym)
-    for t, cur in _news_file_events() + nfp_events(epoch):
+    for t, cur in _all_news_events(epoch):
         if cur & ccy and epoch < t <= epoch + minutes * 60:
             return t
     return None
+
+
+def _easter(y):
+    """Dimanche de Pâques (algorithme grégorien)."""
+    a, b, c = y % 19, y // 100, y % 100
+    d, e, f = b // 4, b % 4, (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month, day = divmod(h + l - 7 * m + 114, 31)
+    return date(y, month, day + 1)
+
+
+def _nth_weekday(y, m, wd, n):
+    """n-ième jour de semaine `wd` (0 = lundi) du mois ; n = -1 : le dernier."""
+    if n > 0:
+        first = date(y, m, 1)
+        return first + timedelta(days=(wd - first.weekday()) % 7 + 7 * (n - 1))
+    last = date(y + (m == 12), m % 12 + 1, 1) - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - wd) % 7)
+
+
+@lru_cache(maxsize=16)
+def holidays_of(year):
+    """{date: (nom, marché)} : jours fériés qui assèchent le forex. Marché : ALL, UK ou US. Les reports de jours fériés
+    tombant un week-end ne sont pas gérés ; Columbus Day et Veterans Day sont ignorés."""
+    out = {}
+
+    def add(d, name, mkt):
+        out[d] = (f"{out[d][0]} / {name}", "ALL") if d in out else (name, mkt)
+
+    e = _easter(year)
+    add(date(year, 1, 1), "Nouvel an", "ALL")
+    add(date(year, 12, 25), "Noël", "ALL")
+    add(e - timedelta(days=2), "Vendredi saint", "ALL")
+    add(e + timedelta(days=1), "Lundi de Pâques", "UK")
+    add(date(year, 12, 26), "Boxing Day", "UK")
+    add(_nth_weekday(year, 5, 0, 1), "Early May bank holiday", "UK")
+    add(_nth_weekday(year, 5, 0, -1), "Spring bank holiday", "UK")
+    add(_nth_weekday(year, 5, 0, -1), "Memorial Day", "US")   # même jour : fusionné en ALL
+    add(_nth_weekday(year, 8, 0, -1), "Summer bank holiday", "UK")
+    add(_nth_weekday(year, 1, 0, 3), "MLK Day", "US")
+    add(_nth_weekday(year, 2, 0, 3), "Presidents Day", "US")
+    add(date(year, 6, 19), "Juneteenth", "US")
+    add(date(year, 7, 4), "Independence Day", "US")
+    add(_nth_weekday(year, 9, 0, 1), "Labor Day", "US")
+    add(_nth_weekday(year, 11, 3, 4), "Thanksgiving", "US")
+    return out
+
+
+def _holiday_file_dates():
+    if "holidays" not in _NEWS_CACHE:
+        out = {}
+        try:
+            with open(HOLIDAYS_FILE, encoding="utf-8") as f:
+                for e in json.load(f):
+                    d, name = (e, "Jour férié (fichier)") if isinstance(e, str) else (e["date"], e.get("name", "Jour férié (fichier)"))
+                    out[date.fromisoformat(str(d)[:10])] = name
+        except Exception:
+            pass
+        _NEWS_CACHE["holidays"] = out
+    return _NEWS_CACHE["holidays"]
+
+
+def holiday_name(epoch):
+    """Nom du jour férié qui touche l'instant `epoch` : jour férié britannique (date de Londres), américain (date de
+    New York), commun, ou date du fichier HOLIDAYS_FILE (date UTC) ; None sinon."""
+    names = []
+    for tz, mkt in ((LONDON, "UK"), (NY, "US")):
+        d = datetime.fromtimestamp(epoch, tz).date()
+        h = holidays_of(d.year).get(d)
+        if h and h[1] in ("ALL", mkt):
+            names.append(h[0])
+    fd = _holiday_file_dates().get(datetime.fromtimestamp(epoch, timezone.utc).date())
+    if fd:
+        names.append(fd)
+    return ", ".join(dict.fromkeys(names)) or None
+
+
+def holiday_blackout(sym, epoch):
+    return bool(HOLIDAY_FILTER and sym.startswith("frx") and holiday_name(epoch))
+
+
+def market_blackout(sym, epoch):
+    """Pas d'alerte : annonce, rollover ou jour férié (forex et or ; annonces USD aussi pour les cryptos)."""
+    return news_blackout(sym, epoch) or rollover_blackout(sym, epoch) or holiday_blackout(sym, epoch)
 
 
 def rollover_blackout(sym, epoch):
@@ -836,9 +1089,9 @@ def rollover_blackout(sym, epoch):
 
 def risk_gate(stats, now):
     """Raison de suspendre les nouvelles alertes (plafond de trades, perte du jour ou de la semaine en R géré), sinon None."""
-    n_open = len(stats.get("pending", {}))
+    n_open = len(exposed_trades(stats))
     if n_open >= MAX_OPEN_TRADES:
-        return ("cap", f"{n_open} trades déjà suivis (plafond {MAX_OPEN_TRADES})")
+        return ("cap", f"{n_open} trades exposés, soit environ {n_open * RISK_PCT:g} % de risque engagé (plafond {MAX_OPEN_TRADES} trades)")
     dt = datetime.fromtimestamp(now, NY)
     day0 = dt.replace(hour=0, minute=0, second=0, microsecond=0)
     week0 = day0 - timedelta(days=day0.weekday())
@@ -865,12 +1118,18 @@ def exposure_group(sym, d):
     return None
 
 
+def exposed_trades(stats):
+    """Trades qui portent un risque : en attente ou ouverts. Sauf COUNT_PROTECTED_TRADES, un trade qui a atteint TP1 est
+    supposé sécurisé (SL au point d'entrée, comme le rappelle l'alerte) et n'est plus compté."""
+    return [t for t in stats.get("pending", {}).values() if COUNT_PROTECTED_TRADES or not t.get("tp1_hit")]
+
+
 def correlated_open(stats, sym, d):
-    """Nombre de trades suivis (en attente ou ouverts) sur le même côté du même groupe corrélé."""
+    """Nombre de trades exposés sur le même côté du même groupe corrélé."""
     g = exposure_group(sym, d)
     if g is None:
         return 0
-    return sum(1 for t in stats.get("pending", {}).values() if exposure_group(t["symbol"], t["direction"]) == g)
+    return sum(1 for t in exposed_trades(stats) if exposure_group(t["symbol"], t["direction"]) == g)
 
 
 REF_RANK = {"W1": 3, "D1": 2, "H4": 1}
@@ -892,7 +1151,7 @@ def analyze(sym, htf, ltf_by_tf, now=None):
     """Cherche les setups CRT d'un symbole : sweep -> cassure de structure impulsive -> FVG et/ou OB.
     `now` : instant de l'analyse (le backtest rejoue le passé)."""
     now = time.time() if now is None else now
-    if news_blackout(sym, now) or rollover_blackout(sym, now):
+    if market_blackout(sym, now):
         return []   # pas de verrou : le setup sera renvoyé après la fenêtre s'il est toujours valide
     info = trend_info(htf["D1"]) if htf.get("D1") else {"trend": None, "age": None}
     trend = info["trend"]
@@ -956,6 +1215,9 @@ def analyze(sym, htf, ltf_by_tf, now=None):
                     continue
                 if SKIP_MITIGATED and not is_synthetic(sym) and is_mitigated(d, st["j"], t["entry"], ltf):
                     continue  # l'entrée a déjà été retestée : le setup est moins fiable
+                t = with_obstacles(d, t, htf, ny)
+                if t is None:
+                    continue  # un obstacle se dresse avant TP1, ou le ratio jusqu'à l'obstacle est insuffisant
                 session = killzone(sym, c["epoch"])
                 if session is None and REQUIRE_KILLZONE_FOR_REAL_MARKETS:
                     continue
@@ -972,6 +1234,94 @@ def analyze(sym, htf, ltf_by_tf, now=None):
     return setups
 
 
+def session_windows(day):
+    """Fenêtres (début, fin) en epoch UTC des trois sessions pour la journée `day` (date locale de Londres), selon
+    SESSION_SCHEDULE. L'Asie du jour commence la veille au soir (killzone) ou à minuit UTC (normal)."""
+    at = lambda tz, h, m=0, d=day: datetime(d.year, d.month, d.day, h, m, tzinfo=tz).timestamp()
+    if SESSION_SCHEDULE == "normal":
+        l0, n0 = at(LONDON, 8), at(NY, 8)
+        return {"asia": (at(timezone.utc, 0), l0), "london": (l0, n0), "newyork": (n0, at(NY, 17))}
+    if SESSION_SCHEDULE == "mixed":
+        return {"asia": (at(timezone.utc, 0), at(NY, 2)), "london": (at(NY, 2), at(NY, 5)), "newyork": (at(NY, 7), at(NY, 12))}
+    prev = day - timedelta(days=1)
+    return {"asia": (at(NY, 20, d=prev), at(NY, 0)), "london": (at(NY, 2), at(NY, 5)),
+            "newyork": (at(NY, 7), at(NY, 12))}
+
+
+def analyze_session(sym, htf, ltf_by_tf, now=None):
+    """CRT par sessions (forex et or) : range asiatique balayé pendant Londres puis réintégré, distribution à New York."""
+    now = time.time() if now is None else now
+    if not sym.startswith("frx") or market_blackout(sym, now):
+        return []
+    full = ltf_by_tf.get("M15")
+    if not full or len(full) < 20:
+        return []
+    ltf, price = full[:-1], full[-1]["close"]
+    atr_d1 = ref_atr("D1", htf, False)
+    info = trend_info(htf["D1"]) if htf.get("D1") else {"trend": None, "age": None}
+    trend = info["trend"]
+    pools = find_liquidity_pools(ltf)
+    w = STRUCTURE_SWING_WINDOW.get("M15", DEFAULT_STRUCTURE_SWING_WINDOW)
+    today = datetime.fromtimestamp(now, LONDON).date()
+    setups = []
+    for day in (today, today - timedelta(days=1)):
+        if day.weekday() >= 5:
+            continue
+        win = session_windows(day)
+        (a0, a1), (l0, l1), (n0, n1) = win["asia"], win["london"], win["newyork"]
+        if now < a1 or now >= n1:
+            continue   # l'Asie n'est pas terminée, ou New York est finie : l'ordre n'est plus valable
+        asia = [c for c in ltf if a0 <= c["epoch"] and c["epoch"] + 900 <= a1]
+        if len(asia) < SESSION_MIN_COVERAGE * (a1 - a0) / 900:
+            continue
+        rng = {"high": max(c["high"] for c in asia), "low": min(c["low"] for c in asia), "epoch": a0}
+        size = rng["high"] - rng["low"]
+        if size <= 0 or (atr_d1 and not SESSION_RANGE_MIN_ATR_D1 * atr_d1 <= size <= SESSION_RANGE_MAX_ATR_D1 * atr_d1):
+            continue
+        if REQUIRE_C2_CLOSE_INSIDE and not rng["low"] <= price <= rng["high"]:
+            continue
+        london = [x for x in detect_sweeps(ltf, dict(rng, epoch=l0 - 1), 900, True) if l0 <= x["candle"]["epoch"] < l1]
+        if not london or (SKIP_BOTH_SIDES_SWEPT and {x["dir"] for x in london} == {"BUY", "SELL"}):
+            continue
+        for sw0 in london:
+            d, c = sw0["dir"], sw0["candle"]
+            depth = (c["high"] - rng["high"]) if d == "SELL" else (rng["low"] - c["low"])
+            if depth > SESSION_SWEEP_MAX_RANGE_FRAC * size or (atr_d1 and depth > SESSION_SWEEP_MAX_ATR_D1 * atr_d1):
+                continue
+            if REQUIRE_C2_CLOSE_INSIDE and sweep_invalidated(ltf, sw0["i"], d, rng):
+                continue
+            st = structure_shift(ltf, sw0["i"], d, w)
+            if not st or ltf[st["j"]]["epoch"] >= n1:
+                continue
+            fvg = detect_fvg(ltf, sw0["i"], st["j"], d)
+            ob = detect_order_block(ltf, st["j"], d, sw0["i"])
+            if not fvg and not ob or (REQUIRE_FVG and not fvg):
+                continue
+            counter = (trend == "bullish" and d == "SELL") or (trend == "bearish" and d == "BUY")
+            if BLOCK_COUNTER_TREND and counter:
+                continue
+            ext = c["high"] if d == "SELL" else c["low"]
+            sw = {"dir": d, "i": sw0["i"], "sl": ext, "range": rng, "closed": ltf, "fvg": fvg}
+            t = build_trade(sym, sw, {"j": st["j"], "m": ltf, "epoch": ltf[st["j"]]["epoch"]}, price, pools)
+            if t is None or is_stale(d, st["j"], t, full):
+                continue
+            if SKIP_MITIGATED and is_mitigated(d, st["j"], t["entry"], ltf):
+                continue
+            t = with_obstacles(d, t, htf, False)
+            if t is None:
+                continue
+            phase = "london" if now < n0 else "newyork"
+            setups.append({
+                "sym": sym, "ref_n": "Asie", "conf_n": "M15", "ref_epoch": a0, "mode": "session",
+                "dir": d, "sw": sw, "fvg": fvg, "ob": ob, "trade": t, "ltf": ltf, "price": price,
+                "session": f"{SESSION_LABELS[phase]} ({'manipulation' if phase == 'london' else 'distribution'})",
+                "grabbed": near_level(ext, pools[0] if d == "SELL" else pools[1]), "counter": counter, "poi": None,
+                "asia": rng, "expires": n1, "max_age": max(60, int(n1 - now)),
+                "trend": trend, "trend_age": info["age"],
+            })
+    return setups
+
+
 def legacy_key(s, k_range):
     """Ancien format de clé (avant l'ajout du sens), pour ne pas renvoyer un setup déjà alerté. Mode loose uniquement."""
     return k_range.rsplit("_", 1)[0] if s.get("mode", "loose") == "loose" else None
@@ -979,12 +1329,13 @@ def legacy_key(s, k_range):
 
 def current_variant():
     """Variante CRT active : « loose » ou le mode d'entrée strict choisi (ote, mid, ote_confirm)."""
-    return "loose" if CRT_MODE == "loose" else STRICT_ENTRY
+    return {"loose": "loose", "session": "session"}.get(CRT_MODE, STRICT_ENTRY)
 
 
 def variant_label(v):
     return {"loose": "CRT", "ote": "CRT strict · OTE de C2", "mid": "CRT strict · 50 % de C2",
-            "ote_confirm": "CRT strict · OTE de C2 + confirmation"}[v]
+            "ote_confirm": "CRT strict · OTE de C2 + confirmation",
+            "session": "CRT sessions · Asie, Londres, New York"}[v]
 
 
 def strict_candles(ref_n, htf, ny=False):
@@ -1046,7 +1397,7 @@ def analyze_strict(sym, htf, ltf_by_tf, now=None, entry=None):
     STRICT_ENTRY). `entry` : ote, mid ou ote_confirm (défaut : STRICT_ENTRY)."""
     now = time.time() if now is None else now
     entry = entry or STRICT_ENTRY
-    if news_blackout(sym, now) or rollover_blackout(sym, now):
+    if market_blackout(sym, now):
         return []
     info = trend_info(htf["D1"]) if htf.get("D1") else {"trend": None, "age": None}
     trend = info["trend"]
@@ -1114,6 +1465,9 @@ def analyze_strict(sym, htf, ltf_by_tf, now=None, entry=None):
                 continue
             if SKIP_MITIGATED and is_mitigated(d, st["j"], t["entry"], ltf):
                 continue
+            t = with_obstacles(d, t, htf, ny)
+            if t is None:
+                continue
             session = killzone(sym, ltf[i0]["epoch"])
         else:
             level = STRICT_OTE_LEVEL if entry == "ote" else STRICT_MID_LEVEL
@@ -1126,6 +1480,9 @@ def analyze_strict(sym, htf, ltf_by_tf, now=None, entry=None):
             if SKIP_MITIGATED and any((x["high"] >= t["entry"]) if d == "SELL" else (x["low"] <= t["entry"])
                                       for x in after[:-1]):
                 continue   # l'entrée a déjà été touchée pendant C3 : l'ordre aurait été rempli avant l'alerte
+            t = with_obstacles(d, t, htf, ny)
+            if t is None:
+                continue
             session = killzone(sym, int(now))
             sw = {"dir": d, "i": None, "sl": ext2, "range": rng, "closed": ltf, "fvg": None}
         swept_pools = pools[0] if d == "SELL" else pools[1]
@@ -1144,6 +1501,8 @@ def analyze_variant(sym, htf, ltf_by_tf, now=None, variant=None):
     variant = variant or current_variant()
     if variant == "loose":
         return analyze(sym, htf, ltf_by_tf, now=now)
+    if variant == "session":
+        return analyze_session(sym, htf, ltf_by_tf, now=now)
     return analyze_strict(sym, htf, ltf_by_tf, now=now, entry=variant)
 
 
@@ -1307,10 +1666,11 @@ def size_line(sym, entry, sl):
         return None
     risk, dist, s = ACCOUNT_BALANCE * RISK_PCT / 100, abs(entry - sl), sym[3:]
     units = risk * entry / dist if (s.startswith("USD") and not s.endswith("USD")) else risk / dist  # risque en devise cotée
+    lot = next((v for k, v in sorted(LOT_UNITS.items(), key=lambda kv: -len(kv[0])) if sym.startswith(k)), 1)
     if sym.startswith("frxXAU"):
-        txt = f"{units / 100:.2f} lot ({units:.1f} oz)"
+        txt = f"{units / lot:.2f} lot ({units:.1f} oz)"
     elif sym.startswith("frx"):
-        txt = f"{units / 100000:.2f} lot"
+        txt = f"{units / lot:.2f} lot"
     else:
         txt = f"{units:.4g} {s[:-3]}"
     return f"💼 Taille ≈ {txt} (risque {RISK_PCT:g} %)"
@@ -1331,6 +1691,8 @@ def crt_message(s, price, dec=None):
         f"Range {s['ref_n']}  {c(r['low'])} - {c(r['high'])}",
         f"✅ Sweep  {c(sw['sl'])}",
     ]
+    if s.get("asia"):
+        lines.append("✅ Range asiatique balayé pendant Londres, puis réintégré")
     if s.get("c2"):
         lines.append("✅ C2 clôturée dans le range de C1")
         lines.append(f"OTE de C2  {c(s['ote_zone'][0])} - {c(s['ote_zone'][1])}")
@@ -1351,8 +1713,15 @@ def crt_message(s, price, dec=None):
     sz = size_line(s["sym"], t["entry"], t["sl"])
     if sz:
         lines.append(sz)
+    if t.get("tp2_cap"):
+        lines.append(f"🚧 TP2 plafonné à {t['tp2_cap']} ; ancien TP2 en TP3")
+    elif t.get("obstacles"):
+        n0, l0 = t["obstacles"][0]
+        lines.append(f"🚧 Obstacle avant TP2 : {n0} {c(l0)} (R:R jusqu'à l'obstacle {t['obstacle_rr']:.1f})")
     if s.get("expires"):
         lines.append("⏳ Ordre valable jusqu'au " + datetime.fromtimestamp(s["expires"], timezone.utc).strftime("%d/%m %H:%M UTC"))
+    if s.get("feed_note"):
+        lines.append("ℹ️ Niveaux issus du flux Deriv : vérifie l'écart avec ton courtier avant de placer l'ordre")
     if MANAGEMENT_NOTE:
         lines.append("📌 Gestion : la moitié à TP1, SL au point d'entrée, le reste vers TP2")
     return "\n".join(lines)
@@ -1372,6 +1741,67 @@ def check_symbols(api, symbols=None):
         print(f"check_symbols ignoré: {e}")
 
 
+def trade_events(before, stats):
+    """Messages de gestion à partir de l'état des trades avant et après le suivi : ordre rempli, TP1 atteint (sécuriser),
+    trade clos (TP2, SL, ordre expiré)."""
+    msgs = []
+    for key, b in before.items():
+        name = f"{display_name(b['symbol'])} {b['direction']}"
+        cur = stats["pending"].get(key)
+        h = None
+        if cur is not None:
+            filled, tp1 = cur["filled"], cur["tp1_hit"]
+        else:
+            h = next((x for x in reversed(stats["history"]) if x["symbol"] == b["symbol"]
+                      and x["direction"] == b["direction"] and x["alert_epoch"] == b["alert_epoch"]), None)
+            if h is None:
+                continue
+            filled, tp1 = b["filled"] or h["result"] in ("TP", "SL"), h["tp1_hit"]
+        if filled and not b["filled"]:
+            msgs.append(f"✅ Ordre rempli · {name} @ {fmt(b['entry'])} · SL {fmt(b['stop_loss'])} · TP1 {fmt(b['tp1'])}")
+        if tp1 and not b["tp1_hit"] and not (h and h["result"] == "TP" and h.get("win_tp", "tp2") == "tp2" and not h.get("be_hit")):
+            msgs.append(f"🎯 TP1 atteint · {name} : prends la moitié du trade et place le SL au point d'entrée ({fmt(b['entry'])})")
+        if h:
+            r = tracker.managed_r(h)
+            if h["result"] == "TP":
+                msgs.append(f"🏁 TP2 atteint · {name} · {r:+.2f} R (gestion : moitié à TP1, SL au point d'entrée)")
+            elif h["result"] == "SL":
+                label = "Retour au point d'entrée après TP1" if h["tp1_hit"] else "SL touché"
+                msgs.append(f"🛑 {label} · {name} · {r:+.2f} R")
+            elif h["result"] == "EXPIRE":
+                msgs.append(f"⌛ Ordre expiré sans remplissage · {name}")
+    return msgs
+
+
+def maybe_heartbeat(state, stats, scanned, now):
+    """Message « bot actif » une fois par jour à partir de HEARTBEAT_HOUR_UTC : son absence signale un arrêt."""
+    if HEARTBEAT_HOUR_UTC is None:
+        return False
+    dt = datetime.fromtimestamp(now, timezone.utc)
+    key = f"heartbeat_{dt:%Y%m%d}"
+    if dt.hour < HEARTBEAT_HOUR_UTC or key in state:
+        return False
+    state[key] = int(now)
+    recent = sum(1 for t in list(stats["pending"].values()) + stats["history"] if t["alert_epoch"] >= now - 86400)
+    notify(f"✅ Bot CRT actif · {variant_label(current_variant())} · {scanned} symboles scannés · "
+           f"{recent} alerte(s) sur 24 h · {len(exposed_trades(stats))} trade(s) exposé(s), {len(stats['pending'])} suivi(s).")
+    return True
+
+
+def notify_error(exc, now=None):
+    """Prévient sur Telegram qu'une exécution a échoué ; une même erreur n'est renvoyée qu'après ERROR_REPEAT_HOURS."""
+    now = time.time() if now is None else now
+    msg = f"{type(exc).__name__}: {str(exc)[:200]}"
+    key = "err_" + hashlib.md5(msg.encode()).hexdigest()[:8]
+    state = load(STATE_FILE)
+    if key in state and now - state[key] < ERROR_REPEAT_HOURS * 3600:
+        return False
+    state[key] = int(now)
+    save(STATE_FILE, state)
+    notify(f"❌ Erreur du bot CRT : {msg}\nConsulte le dernier run dans l'onglet Actions de GitHub.")
+    return True
+
+
 def main():
     cache, state, stats = load(CACHE_FILE), load(STATE_FILE), tracker.load_stats()
     api = Deriv()
@@ -1381,6 +1811,7 @@ def main():
         print("ATTENTION : secret Telegram manquant ou vide (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID)")
     try:
         check_symbols(api)
+        refresh_news_feed(cache)
         for sym in SYMBOLS:
             scanned += 1
             htf = {tf: tf_candles(api, cache, sym, tf) for tf in ("D1", "H4")}
@@ -1418,6 +1849,9 @@ def main():
                 price = fresh[-1]["close"] if fresh else s["price"]
                 t["otype"] = order_type(s["dir"], t["entry"], price)
                 sent += 1
+                if PRICE_FEED_NOTE and f"feednote_{datetime.now(NY):%Y%m%d}" not in state:   # une fois par jour
+                    state[f"feednote_{datetime.now(NY):%Y%m%d}"] = now
+                    s["feed_note"] = True
                 notify(crt_message(s, price, decimals(s["ltf"])), html=True)
                 tracker.add_pending(stats, k_range, s, now)
         # trades ouverts : avertissement avant une annonce
@@ -1432,11 +1866,16 @@ def main():
                        "Pense à sécuriser (SL au point d'entrée) ou à réduire.")
         # suivi des trades : remplissage, SL / TP2, expiration, purge
         lookup = lambda sym, tf: tf_candles(api, cache, sym, tf)
+        before = {k: dict(t) for k, t in stats["pending"].items()}
         done = tracker.resolve_pending(stats, lookup)
         expired, pruned = tracker.expire_stale_pending(stats), tracker.prune_history(stats)
+        if TRADE_NOTIFICATIONS:
+            for msg in trade_events(before, stats):
+                notify(msg)
         if done or expired or pruned:
             print(f"Suivi CRT : {len(done)} archivé(s), {expired} expiré(s), {pruned} purgé(s).")
         summary = tracker.summarize(stats)
+        maybe_heartbeat(state, stats, scanned, time.time())
         if os.getenv("NOTIFY_OK") == "1":
             notify(f"Bot CRT OK : {scanned} symboles scannés, {sent} alerte(s).\n{summary}")
         print(f"Scan terminé : {scanned} symboles, {sent} alerte(s).")
@@ -1451,4 +1890,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        try:
+            notify_error(exc)
+        except Exception:
+            pass   # l'échec de la notification ne doit pas masquer l'erreur d'origine
+        raise

@@ -8,8 +8,13 @@ le timeframe de confirmation, donc moins de cas SL/TP dans la même bougie qu'en
 
 Usage : python backtest.py [--strategy crt|impulse] [--days 30] [--symbols R_75,frxEURUSD] [--out fichier.csv]
         [--trend-mode structure|deplacement|swings|all]   (all : mêmes données rejouées avec les trois lectures de tendance)
-        [--crt-mode loose|ote|mid|ote_confirm|all]        (CRT : mode historique ou CRT strict avec l'entrée choisie ;
-                                                           all : compare les quatre sur le même historique)
+        [--crt-mode loose|ote|mid|ote_confirm|session|all] (CRT : mode historique, CRT strict avec l'entrée choisie ou
+                                                           sessions Asie/Londres/New York (forex et or) ;
+                                                           all : compare les cinq sur le même historique)
+        [--folds 3]        résultats par tranches de temps consécutives (stabilité)
+        [--portfolio]      applique a posteriori les limites de risque et de corrélation du bot, tous symboles confondus
+        [--sensitivity]    rejoue une variante en faisant varier ses paramètres un à un (robustesse)
+        [--ny-aligned]     D1/H4 avec ouverture 17h New York (forex et or), reconstruits depuis le H1
 Limites : 5000 bougies par requête Deriv, soit 45 jours maximum en M15 (CRT) et 16 jours en M5 (Impulsion).
 Pas de spread, de commission ni de glissement. Gain compté sur la cible de gain entière : TP2 pour le CRT,
 TP1 pour l'Impulsion (-1 pour un SL). Alignement 17h NY ignoré. Les ordres limites de l'Impulsion
@@ -51,10 +56,22 @@ STRATEGIES = {
 }
 
 
+NY_HISTORY = False   # --ny-aligned : D1/H4 reconstruits depuis le H1 avec ouverture à 17h New York (forex et or)
+
+
 def fetch_history(api, sym, days, tfs):
     """Historique d'un symbole pour les timeframes demandés, ou None si indisponible."""
     out = {}
+    ny = NY_HISTORY and not bot.is_247(sym)
+    h1 = None
+    if ny:   # D1 et H4 viennent du H1 : 75 jours de recul pour la tendance, les ATR et les semaines complètes
+        h1 = api.candles(sym, bot.GRAN["H1"], count=min((days + 75) * 24, 5000))
+        if not h1:
+            return None
     for tf in tfs:
+        if ny and tf in ("D1", "H4"):
+            out[tf] = bot.aggregate_ny(h1, 24 if tf == "D1" else 4)
+            continue
         n = 400 if tf == "D1" else days * 86400 // bot.GRAN[tf] + bot.COUNT + 20
         cs = api.candles(sym, bot.GRAN[tf], count=min(n, 5000))
         if not cs:
@@ -158,13 +175,24 @@ def split_lines(strat, trades, days, oos):
             "  " + group_line("Première partie", a, strat["win"]), "  " + group_line("Dernière partie", b, strat["win"])]
 
 
+def fold_lines(strat, trades, days, folds):
+    """Résultats par tranches de temps consécutives et de même durée : un résultat solide se retrouve dans la plupart d'entre elles."""
+    start, width = time.time() - days * 86400, days * 86400 / folds
+    out = ["", f"Stabilité par tranches ({folds} tranches de {days / folds:.0f} jours)"]
+    for k in range(folds):
+        a, b = start + k * width, start + (k + 1) * width
+        part = [x for x in trades if a <= x["alert_epoch"] < b or (k == folds - 1 and x["alert_epoch"] >= b)]
+        out.append("  " + group_line(f"Tranche {k + 1}/{folds}", part, strat["win"]))
+    return out
+
+
 def fill_stats(trades):
     """(remplis, décidés) : un ordre est décidé quand il est rempli ou expiré ; les ordres encore en attente sont exclus."""
     decided = [x for x in trades if x["result"] != "EN_ATTENTE"]
     return sum(1 for x in decided if x["filled"]), len(decided)
 
 
-def summary(strat, trades, days, oos=0.0, label=None):
+def summary(strat, trades, days, oos=0.0, label=None, folds=0):
     win = strat["win"]
     if not trades:
         return "Aucun setup détecté sur la période."
@@ -172,6 +200,8 @@ def summary(strat, trades, days, oos=0.0, label=None):
     L.append(group_line("Global", trades, win))
     if oos:
         L += split_lines(strat, trades, days, oos)
+    if folds > 1:
+        L += fold_lines(strat, trades, days, folds)
     counts = {k: sum(1 for x in trades if x["result"] == k) for k in ("EXPIRE", "OUVERT", "EN_ATTENTE")}
     L.append(f"Non résolus : {counts['EXPIRE']} expirés (jamais remplis), {counts['OUVERT']} ouverts, "
              f"{counts['EN_ATTENTE']} en attente")
@@ -281,6 +311,115 @@ def compare(strat, by_mode):
     return "\n".join(L)
 
 
+def apply_portfolio(trades):
+    """Applique a posteriori, dans l'ordre des alertes et tous symboles confondus, les limites du bot : plafond de trades
+    exposés, pertes du jour et de la semaine (R géré), plafond de corrélation (mode block). Approximation : un trade
+    bloqué n'est pas rejoué plus tard, et un trade ouvert est compté comme non sécurisé (le moment de TP1 n'est pas
+    connu à cet instant). Retourne (trades retenus, nombre de trades écartés)."""
+    def end(x):
+        if x["result"] in ("TP", "SL"):
+            return x["resolved_epoch"]
+        return x["alert_epoch"] + x["max_age"] if x["result"] == "EXPIRE" else float("inf")
+
+    kept = []
+    for tr in sorted(trades, key=lambda x: x["alert_epoch"]):
+        t = tr["alert_epoch"]
+        live = [x for x in kept if end(x) > t]
+        hist = [x for x in kept if x["result"] in ("TP", "SL") and x["resolved_epoch"] <= t]
+        stats = {"pending": {i: {"symbol": x["symbol"], "direction": x["direction"], "tp1_hit": False}
+                             for i, x in enumerate(live)}, "history": hist}
+        if bot.risk_gate(stats, t) or bot.correlated_open(stats, tr["symbol"], tr["direction"]) >= bot.MAX_CORRELATED_OPEN:
+            continue
+        kept.append(tr)
+    return kept, len(trades) - len(kept)
+
+
+SENSITIVITY_GRIDS = {
+    "loose": {"MSS_BODY_MULT": [0.8, 1.2, 1.6], "SWEEP_MAX_RANGE_FRAC": [0.3, 0.5, 0.8], "RANGE_MIN_ATR": [0.4, 0.6, 0.9],
+              "STOP_LOSS_BUFFER_ATR": [0.05, 0.15, 0.30], "MIN_RISK_REWARD": [2.0, 3.0, 4.0]},
+    "ote": {"STRICT_OTE_LEVEL": [0.62, 0.705, 0.79], "SWEEP_MAX_RANGE_FRAC": [0.3, 0.5, 0.8], "RANGE_MIN_ATR": [0.4, 0.6, 0.9],
+            "STRICT_SL_BUFFER_ATR": [0.0, 0.05, 0.15], "MIN_RISK_REWARD": [2.0, 3.0, 4.0]},
+    "mid": {"STRICT_MID_LEVEL": [0.4, 0.5, 0.6], "SWEEP_MAX_RANGE_FRAC": [0.3, 0.5, 0.8], "RANGE_MIN_ATR": [0.4, 0.6, 0.9],
+            "STRICT_SL_BUFFER_ATR": [0.0, 0.05, 0.15], "MIN_RISK_REWARD": [2.0, 3.0, 4.0]},
+    "ote_confirm": {"MSS_BODY_MULT": [0.8, 1.2, 1.6], "SWEEP_MAX_RANGE_FRAC": [0.3, 0.5, 0.8],
+                    "STOP_LOSS_BUFFER_ATR": [0.05, 0.15, 0.30], "MIN_RISK_REWARD": [2.0, 3.0, 4.0]},
+    "session": {"SESSION_RANGE_MIN_ATR_D1": [0.10, 0.15, 0.25], "SESSION_SWEEP_MAX_ATR_D1": [0.2, 0.4, 0.6],
+                "MSS_BODY_MULT": [0.8, 1.2, 1.6], "MIN_RISK_REWARD": [2.0, 3.0, 4.0]},
+}
+
+
+def run_sensitivity(api, strat, symbols, days, variant, log=print):
+    """Rejoue `variant` avec ses valeurs par défaut, puis en faisant varier ses paramètres un à un (SENSITIVITY_GRIDS) sur
+    le même historique téléchargé une seule fois. Retourne [(paramètre, valeur, trades, est_la_valeur_par_défaut)]."""
+    global CRT_VARIANT
+    start = int(time.time()) - days * 86400
+    hists = []
+    for n, sym in enumerate(symbols, 1):
+        h = fetch_history(api, sym, days, strat["tfs"])
+        log(f"[{n}/{len(symbols)}] {sym} : " + ("historique chargé" if h else "historique indisponible, ignoré"))
+        if h:
+            hists.append((sym, h))
+    original = CRT_VARIANT
+    CRT_VARIANT = variant
+
+    def replay_all():
+        return [t for sym, h in hists for t in replay(strat, sym, h, start)]
+
+    rows = []
+    try:
+        base = replay_all()
+        for param, values in SENSITIVITY_GRIDS[variant].items():
+            default = getattr(bot, param)
+            for v in values:
+                if v == default:
+                    rows.append((param, v, base, True))
+                    continue
+                setattr(bot, param, v)
+                try:
+                    rows.append((param, v, replay_all(), False))
+                finally:
+                    setattr(bot, param, default)
+            log(f"  {param} : {len(values)} valeurs rejouées")
+    finally:
+        CRT_VARIANT = original
+    return rows
+
+
+def write_sensitivity_csv(path, rows):
+    import csv
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["parametre", "valeur", "valeur_actuelle", "alertes", "remplissage_pct", "resolus", "reussite_pct",
+                    "r_net_par_trade", "r_net_par_alerte"])
+        for param, v, trs, is_default in rows:
+            res = [x for x in trs if x["result"] in ("TP", "SL")]
+            filled, decided = fill_stats(trs)
+            w.writerow([param, v, int(is_default), len(trs), round(100 * filled / decided, 1) if decided else "", len(res),
+                        round(100 * sum(1 for x in res if x["result"] == "TP") / len(res), 1) if res else "",
+                        round(sum(r_net(x) for x in res) / len(res), 3) if res else "",
+                        round(sum(r_net(x) for x in res) / len(trs), 3) if trs else ""])
+
+
+def sensitivity_table(variant, rows):
+    L = [f"SENSIBILITÉ DES PARAMÈTRES : {bot.variant_label(variant)} (un paramètre varie, les autres gardent leur valeur par défaut)",
+         "", f"{'paramètre':<26} {'valeur':>7} {'alertes':>8} {'remplis':>8} {'résolus':>8} {'réussite':>9} {'R net/trade':>11} {'R net/alerte':>12}"]
+    for param, v, trs, is_default in rows:
+        res = [x for x in trs if x["result"] in ("TP", "SL")]
+        filled, decided = fill_stats(trs)
+        fill = f"{100 * filled / decided:.0f} %" if decided else "-"
+        mark = "*" if is_default else " "
+        if res:
+            wins = sum(1 for x in res if x["result"] == "TP")
+            L.append(f"{param:<26} {v:>6g}{mark} {len(trs):>8} {fill:>8} {len(res):>8} {100 * wins / len(res):>8.1f}% "
+                     f"{sum(r_net(x) for x in res) / len(res):>+11.2f} {sum(r_net(x) for x in res) / len(trs):>+12.2f}")
+        else:
+            L.append(f"{param:<26} {v:>6g}{mark} {len(trs):>8} {fill:>8} {0:>8} {'-':>9} {'-':>11} {'-':>12}")
+    L += ["", "* = valeur actuelle du bot. Lecture : une stratégie robuste varie peu quand un paramètre bouge un peu autour de sa",
+          "valeur ; un résultat qui ne tient que sur une valeur précise est un signe de sur-ajustement. Avec peu d'alertes, les",
+          "écarts sont du bruit : ne choisis pas la « meilleure » ligne, vérifie seulement que le choix actuel n'est pas isolé."]
+    return "\n".join(L)
+
+
 def run_variants(api, strat, symbols, days, variants, log=print):
     """Rejoue chaque symbole une fois par variante CRT (loose, ote, mid, ote_confirm), sur le même historique téléchargé
     une seule fois. Retourne {variante: trades}."""
@@ -339,15 +478,26 @@ def main():
     p.add_argument("--trend-mode", choices=list(bot.TREND_MODES) + ["all"], default=bot.TREND_MODE,
                    help="lecture de tendance : structure (précoce), deplacement (structure + cassure impulsive), "
                         "swings (3 swings + SMA 50) ou all (comparaison des trois)")
-    p.add_argument("--crt-mode", choices=list(bot.STRICT_ENTRIES) + ["loose", "all"], default=bot.current_variant(),
-                   help="CRT : loose (mode historique), ote / mid / ote_confirm (CRT strict, C2 clôturée) "
-                        "ou all (compare les quatre sur le même historique)")
+    p.add_argument("--crt-mode", choices=list(bot.STRICT_ENTRIES) + ["loose", "session", "all"], default=bot.current_variant(),
+                   help="CRT : loose (mode historique), ote / mid / ote_confirm (CRT strict, C2 clôturée), session (Asie/Londres/New York, forex et or) "
+                        "ou all (compare les cinq sur le même historique)")
     p.add_argument("--no-costs", action="store_true", help="ignore le spread et le glissement estimés (R brut = R net)")
     p.add_argument("--oos", type=float, default=0.3,
                    help="part finale de la période isolée pour juger la stabilité (0 pour désactiver, défaut 0,3)")
+    p.add_argument("--folds", type=int, default=3,
+                   help="nombre de tranches de temps consécutives pour juger la stabilité (0 ou 1 pour désactiver, défaut 3)")
+    p.add_argument("--portfolio", action="store_true",
+                   help="applique a posteriori les limites de risque et de corrélation du bot, tous symboles confondus")
+    p.add_argument("--sensitivity", action="store_true",
+                   help="CRT : rejoue la variante choisie en faisant varier ses paramètres un à un (pas avec --crt-mode all)")
+    p.add_argument("--ny-aligned", action="store_true",
+                   help="D1 et H4 avec ouverture à 17h New York pour le forex et l'or (reconstruits depuis le H1)")
     a = p.parse_args()
-    global COSTS
+    global COSTS, NY_HISTORY
     COSTS = not a.no_costs
+    if a.ny_aligned:
+        bot.NY_ALIGNED = True
+    NY_HISTORY = bool(bot.NY_ALIGNED and a.strategy == "crt")
     strat = STRATEGIES[a.strategy]
     days = max(1, min(a.days, strat["max_days"]))
     if days != a.days:
@@ -356,18 +506,41 @@ def main():
     unknown = [s for s in symbols if s not in strat["symbols"]]
     if unknown:
         sys.exit(f"Symboles inconnus pour la stratégie {a.strategy} : {unknown}")
-    if bot.NY_ALIGNED and a.strategy == "crt":
-        print("NY_ALIGNED ignoré : le backtest utilise les bougies natives de Deriv.")
+    if NY_HISTORY:
+        print("D1 et H4 du forex et de l'or reconstruits depuis le H1 avec ouverture à 17h New York.")
     out = a.out or f"backtest_{a.strategy}.csv"
     global CRT_VARIANT
+    if a.sensitivity:
+        if a.strategy != "crt" or a.crt_mode == "all":
+            sys.exit("--sensitivity demande --strategy crt et une seule variante (--crt-mode loose|ote|mid|ote_confirm|session).")
+        api = bot.Deriv()
+        try:
+            rows = run_sensitivity(api, strat, symbols, days, a.crt_mode)
+        finally:
+            api.close()
+        text = sensitivity_table(a.crt_mode, rows)
+        print("\n" + text)
+        out = a.out or "backtest_sensibilite.csv"
+        write_sensitivity_csv(out, rows)
+        print(f"\nTableau détaillé : {out}")
+        gh = os.getenv("GITHUB_STEP_SUMMARY")
+        if gh:
+            with open(gh, "a", encoding="utf-8") as f:
+                f.write("```\n" + text + "\n```\n")
+        return
     if a.strategy == "crt" and a.crt_mode == "all":
-        variants = ["loose"] + list(bot.STRICT_ENTRIES)
+        variants = ["loose"] + list(bot.STRICT_ENTRIES) + ["session"]
         api = bot.Deriv()
         try:
             by_variant = run_variants(api, strat, symbols, days, variants)
         finally:
             api.close()
-        texts = [f"[{bot.variant_label(v)}]\n{summary(strat, by_variant[v], days, a.oos, label=bot.variant_label(v))}"
+        notes = {}
+        if a.portfolio:
+            for v in variants:
+                by_variant[v], dropped = apply_portfolio(by_variant[v])
+                notes[v] = f"Limites de portefeuille appliquées : {dropped} alerte(s) écartée(s).\n"
+        texts = [f"[{bot.variant_label(v)}]\n{notes.get(v, '')}{summary(strat, by_variant[v], days, a.oos, label=bot.variant_label(v), folds=a.folds)}"
                  for v in variants]
         texts.append(compare_variants(by_variant))
         text = "\n\n".join(texts)
@@ -385,7 +558,11 @@ def main():
         texts = []
         label = bot.variant_label(CRT_VARIANT) if a.strategy == "crt" else None
         for m in modes:
-            t = summary(strat, by_mode[m], days, a.oos, label=label)
+            note = ""
+            if a.portfolio:
+                by_mode[m], dropped = apply_portfolio(by_mode[m])
+                note = f"Limites de portefeuille appliquées : {dropped} alerte(s) écartée(s).\n"
+            t = note + summary(strat, by_mode[m], days, a.oos, label=label, folds=a.folds)
             texts.append(f"[tendance : {m}]\n{t}")
         if len(modes) > 1:
             texts.append(compare(strat, by_mode))
