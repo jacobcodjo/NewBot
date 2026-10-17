@@ -19,7 +19,7 @@ on:
           - all
         default: structure
       crt_mode:
-        description: "CRT : all (compare les 4 variantes), loose (mode historique), ote / mid / ote_confirm (CRT strict, C2 clôturée). Ignoré pour l'Impulsion"
+        description: "CRT : all (compare les 5 variantes), loose (mode historique), ote / mid / ote_confirm (CRT strict, C2 clôturée), session (Asie/Londres/New York, forex et or). Ignoré pour l'Impulsion"
         type: choice
         options:
           - all
@@ -27,7 +27,27 @@ on:
           - ote
           - mid
           - ote_confirm
+          - session
         default: all
+      session_schedule:
+        description: "Horaires du CRT par sessions : normal (sessions réelles du forex) ou killzone (Asie 20h-00h, Londres 2h-5h, New York 7h-12h, heure de New York)"
+        type: choice
+        options:
+          - normal
+          - killzone
+        default: normal
+      ny_aligned:
+        description: "CRT : D1 et H4 avec ouverture à 17h New York pour le forex et l'or (reconstruits depuis le H1)"
+        type: boolean
+        default: false
+      portfolio:
+        description: "Applique a posteriori les limites de risque et de corrélation du bot, tous symboles confondus"
+        type: boolean
+        default: false
+      sensitivity:
+        description: "CRT : analyse de sensibilité (une seule variante, pas « all ») : les paramètres varient un à un"
+        type: boolean
+        default: false
       days:
         description: "Durée rejouée en jours"
         default: "30"
@@ -48,7 +68,10 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - run: python backtest.py --strategy "${{ github.event.inputs.strategy }}" --trend-mode "${{ github.event.inputs.trend_mode }}" --crt-mode "${{ github.event.inputs.crt_mode }}" --days "${{ github.event.inputs.days }}" --symbols "${{ github.event.inputs.symbols }}"
+      - env:
+          CRT_SESSION_SCHEDULE: ${{ github.event.inputs.session_schedule }}
+          FLAGS: ${{ format('{0}{1}{2}', github.event.inputs.ny_aligned == 'true' && ' --ny-aligned' || '', github.event.inputs.portfolio == 'true' && ' --portfolio' || '', github.event.inputs.sensitivity == 'true' && ' --sensitivity' || '') }}
+        run: python backtest.py --strategy "${{ github.event.inputs.strategy }}" --trend-mode "${{ github.event.inputs.trend_mode }}" --crt-mode "${{ github.event.inputs.crt_mode }}" --days "${{ github.event.inputs.days }}" --symbols "${{ github.event.inputs.symbols }}" $FLAGS
       - uses: actions/upload-artifact@v4
         if: always()
         with:
