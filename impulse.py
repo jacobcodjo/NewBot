@@ -9,11 +9,12 @@ Les calculs sont écrits pour un achat ; pour une vente, les bougies sont invers
 import os, sys, time
 from collections import Counter
 
+import charts
 import guard as G
 import tracker as T
 from bot import (Deriv, get_candles, load, save, notify, body_avg, swings, atr, body, display_name, code,
                  decimals, ratio_txt, mgmt_line, track_trades, emit_alert, finish_run, print_stats,
-                 GRAN, CASCADES, CACHE_FILE)
+                 vol_regime_ok, GRAN, CASCADES, CACHE_FILE)
 
 SYMBOLS = ["R_10", "R_25", "R_50", "R_75", "R_100",
            "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
@@ -261,6 +262,8 @@ def build_message(name, ltf_n, d, r, dec=None, trend=None, htf_n=None, sym=None)
               f"✅ Sweep  {c(r['sweep'])}"]
     if trend:
         lines.append(f"✅ Tendance {trend['age']} · {htf_n}")
+    if T.STRUCT_EXIT and r.get("inval") is not None:
+        lines.append(f"Invalidation  {c(r['inval'])}  (clôture au-delà = sortie)")
     extra = [x for x in (G.lot_line(sym, r["entry"], r["sl"]) if sym else None, mgmt_line()) if x]
     if extra:
         lines += [""] + extra
@@ -280,6 +283,9 @@ def scan_symbol(sym, provide, now, sent, funnel, align=False):
         if not htf or not mtf:
             continue
         funnel["data"] += 1
+        if not vol_regime_ok(mtf):
+            continue  # volatilité en compression extrême ou en pic
+        funnel["regime"] += 1
         ltf = None
         for d in ("BUY", "SELL"):
             H, M = (htf, mtf) if d == "BUY" else (flip(htf), flip(mtf))
@@ -305,10 +311,24 @@ def scan_symbol(sym, provide, now, sent, funnel, align=False):
             if key in sent:
                 continue  # une seule alerte par impulsion
             name, dec = display_name(sym), decimals(ltf)
+            buy = d == "BUY"
+            inval = r["ob"][0] if buy else r["ob"][1]          # bord de l'OB côté stop
+            r["inval"] = inval
+            origin, extreme = (imp["lo"], imp["hi"]) if buy else (-imp["lo"], -imp["hi"])
+            lines = [{"y": r["entry"], "label": "Entrée", "kind": "entry"}, {"y": r["sl"], "label": "SL", "kind": "sl"},
+                     {"y": r["tp1"], "label": "TP1", "kind": "tp"}, {"y": r["tp2"], "label": "TP2", "kind": "tp"},
+                     {"y": r["tp3"], "label": "TP3", "kind": "tp"}, {"y": r["sweep"], "label": "Sweep", "kind": "sweep"},
+                     {"y": origin, "label": "Origine", "kind": "range"}, {"y": extreme, "label": "Extrême", "kind": "range"}]
+            zones = [{"lo": r["zone"][0], "hi": r["zone"][1], "label": "Zone 50-79 %", "kind": "fib"},
+                     {"lo": r["fvg"][0], "hi": r["fvg"][1], "label": "FVG", "kind": "fvg"},
+                     {"lo": r["ob"][0], "hi": r["ob"][1], "label": "OB", "kind": "ob"}]
+            otype = f"{d} LIMIT" if r["mode"] == "LIMITE" else d
+            chart = {"title": f"{name} · {otype} · {ltf_n} · Impulsion", "dec": dec,
+                     "candles": charts.candles_slice(ltf), "lines": lines, "zones": zones}
             out.append({
                 "bot": "Impulsion", "key": key, "cascade": f"{htf_n}>{mtf_n}>{ltf_n}", "sym": sym,
                 "name": name, "dir": d, "ltf": ltf_n, "gran": GRAN[ltf_n], "dec": dec,
-                "price": r["price"], "otype": f"{d} LIMIT" if r["mode"] == "LIMITE" else d,
+                "price": r["price"], "otype": otype, "inval": inval, "liq": None, "chart": chart,
                 "entry": r["entry"], "sl": r["sl"], "tp1": r["tp1"], "tp2": r["tp2"],
                 "tp3": r["tp3"], "rr": r["rr"], "age": trend["age"], "ttl": PENDING_TTL,
                 "message": build_message(name, ltf_n, d, r, dec, trend, htf_n, sym)})

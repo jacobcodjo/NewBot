@@ -2,7 +2,7 @@
 un seul trade actif par actif et par sens, exposition corrélée, plafond de pertes journalier,
 calcul du lot, surveillance du bot, entonnoir de filtres et bilan hebdomadaire.
 Autonome : aucun import de bot.py (les fonctions d'envoi sont passées en argument)."""
-import json, math, os
+import json, math, os, re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -21,14 +21,30 @@ ROLLOVER = (16 * 60 + 55, 17 * 60 + 15)     # minutes NY : élargissement des sp
 FRIDAY_CLOSE_FROM = 15 * 60 + 30            # vendredi : trop proche de la fermeture hebdomadaire
 SUNDAY_OPEN = (17 * 60, 18 * 60)            # dimanche : ouverture de semaine (gap)
 NFP = (8 * 60, 9 * 60 + 30)                 # premier vendredi du mois, publication à 8h30 NY
+# --- Calendrier économique automatique (flux gratuit Forex Factory / Fair Economy) ---
+CALENDAR_URLS = [u for u in (
+    os.getenv("CALENDAR_URL"),                                   # pour forcer une autre source
+    "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+    "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
+) if u]
+CALENDAR_REFRESH = 6 * 3600     # le flux n'est interrogé qu'une fois toutes les 6 h
+CALENDAR_RETRY = 900            # nouvel essai après 15 min en cas d'échec
+CALENDAR_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CHF", "AUD", "CAD", "NZD"}
+NEWS_BEFORE_MIN = 15            # pas d'alerte 15 min avant un événement à fort impact
+NEWS_AFTER_MIN = 45             # ... ni 45 min après
+BIG_AFTER_MIN = 90              # 90 min après une décision de taux ou une conférence de presse
+BIG_EVENT = re.compile(r"rate|fomc|press conference|monetary policy|statement|minutes", re.I)
+# Décisions de taux de la Fed 2026 (14h ET, conférence de presse à 14h30). Source : calendrier officiel de la Fed.
+FOMC_2026 = ["2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
+             "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09"]
 # --- Surveillance ---
 GAP_ALERT_MIN = 30         # alerte si le bot reprend après plus de 30 min sans scan
 FAILS_ALERT = 3            # alerte après 3 scans de suite sans aucune donnée Deriv
 REPORT_EVERY = 7 * 86400   # bilan envoyé une fois par semaine
 
-FUNNEL_ORDER = ["cascades", "data", "trend", "impulse", "sweep", "range", "poi", "mss", "trade",
-                "blackout", "dedupe", "risk", "alert"]
-FUNNEL_LABEL = {"cascades": "cascades", "data": "données", "trend": "tendance ok", "impulse": "impulsion",
+FUNNEL_ORDER = ["cascades", "data", "regime", "trend", "impulse", "sweep", "range", "poi", "mss", "trade",
+                "blackout", "liquidity", "dedupe", "risk", "alert"]
+FUNNEL_LABEL = {"cascades": "cascades", "data": "données", "regime": "volatilité ok", "liquidity": "écartées (liquidité)", "trend": "tendance ok", "impulse": "impulsion",
                 "range": "range ok", "sweep": "sweep",
                 "poi": "POI", "mss": "MSS", "trade": "trade valide", "blackout": "bloquées (news/horaire)",
                 "dedupe": "doublons", "risk": "bloquées (risque)", "alert": "alertes"}
@@ -69,6 +85,76 @@ def load_news(path=NEWS_FILE):
             return out
     except Exception:
         return []
+
+
+def fomc_events():
+    """Fenêtres FOMC intégrées : de 13h45 à 16h00 New York les jours de décision."""
+    out = []
+    for d in FOMC_2026:
+        day = datetime.fromisoformat(d)
+        t = lambda h, m: day.replace(hour=h, minute=m, tzinfo=NY).timestamp()
+        out.append({"start": t(13, 45), "end": t(16, 0), "note": "FOMC", "cur": ["USD"]})
+    return out
+
+
+def fomc_check(g, now, notify):
+    """Prévient (au plus tous les 14 jours) quand il reste moins de 30 jours de dates FOMC dans le code."""
+    last = max(datetime.fromisoformat(d).replace(hour=16, tzinfo=NY).timestamp() for d in FOMC_2026)
+    if last - now > 30 * 86400 or now - g.get("fomc_warned", 0) < 14 * 86400:
+        return
+    g["fomc_warned"] = int(now)
+    if last < now:
+        notify("⚠️ Plus aucune date FOMC dans guard.py (FOMC_2026). Ajoute les décisions de l'année à venir. "
+               "Le calendrier automatique reste actif, mais ce filet de sécurité est vide.")
+    else:
+        notify(f"⚠️ La dernière date FOMC de guard.py (FOMC_2026) est le {max(FOMC_2026)}. "
+               f"Ajoute bientôt les décisions de l'année suivante.")
+
+
+def _parse_calendar(data):
+    """Événements à fort impact des 8 grandes devises -> fenêtres sans alerte."""
+    out = []
+    for it in data if isinstance(data, list) else []:
+        try:
+            cur = str(it.get("country", "")).upper()
+            if str(it.get("impact", "")).lower() != "high" or cur not in CALENDAR_CURRENCIES:
+                continue
+            ts = datetime.fromisoformat(str(it["date"]).replace("Z", "+00:00")).timestamp()
+            title = str(it.get("title", "événement"))
+            after = BIG_AFTER_MIN if BIG_EVENT.search(title) else NEWS_AFTER_MIN
+            out.append({"start": ts - NEWS_BEFORE_MIN * 60, "end": ts + after * 60,
+                        "note": f"{cur} {title}", "cur": [cur]})
+        except Exception:
+            continue
+    return out
+
+
+def calendar_events(g, now, http_get=None):
+    """Fenêtres sans alerte issues du calendrier automatique + des décisions FOMC intégrées.
+    Le flux est rafraîchi toutes les 6 h ; en cas d'échec, les dernières données restent utilisées."""
+    cal = g.setdefault("calendar", {"fetched": 0, "events": []})
+    if now - cal["fetched"] >= CALENDAR_REFRESH:
+        events, ok = [], False
+        for url in CALENDAR_URLS:
+            try:
+                if http_get is None:
+                    import requests
+                    r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0 (compatible; crt-bot/1.0)"})
+                    r.raise_for_status()
+                    data = r.json()
+                else:
+                    data = http_get(url)
+                events += _parse_calendar(data)
+                ok = True
+            except Exception as e:
+                print(f"Calendrier indisponible ({url.rsplit('/', 1)[-1]}) : {str(e)[:80]}")
+        if ok:
+            cal["events"], cal["fetched"] = events, int(now)
+            print(f"Calendrier mis à jour : {len(events)} événement(s) à fort impact.")
+        else:
+            cal["fetched"] = int(now) - CALENDAR_REFRESH + CALENDAR_RETRY
+    upcoming = [e for e in cal["events"] if e["end"] >= now - 3600]
+    return upcoming + fomc_events()
 
 
 def blackout(sym, now, news=()):

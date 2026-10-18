@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 import requests
 import websocket  # websocket-client
 
+import charts
 import guard as G
 import tracker as T
 
@@ -61,6 +62,11 @@ SL_BUFFER_ATR = 0.1                # ... ou 0,1 x ATR MTF si plus grand (s'adapt
 ATR_N = 14
 RANGE_MIN_ATR = 0.5                # range de référence : au moins 0,5 x ATR HTF (écarte les inside bars)
 RANGE_MAX_ATR = 3.0                # ... et au plus 3 x ATR HTF (écarte les bougies d'actualité géantes)
+VOL_FAST, VOL_SLOW = 14, 100       # régime de volatilité : ATR 14 / ATR 100 du timeframe MTF
+VOL_MIN, VOL_MAX = 0.6, 2.0        # ... doit rester entre 0,6 et 2 (écarte compression extrême et pics d'actualité)
+EQ_TOL_ATR = 0.15                  # equal highs/lows : deux swings à moins de 0,15 ATR l'un de l'autre
+REQUIRE_LIQUIDITY = False          # True : le sweep doit prendre une liquidité (PDH/PDL ou equal highs/lows)
+COUNT_H1_NY = 1200                 # H1 téléchargés pour reconstruire D1/H4 en heure de New York (~50 jours)
 PENDING_TTL_FAST = 24 * 3600       # validité d'un ordre en attente (LTF M5/M15)
 PENDING_TTL_SLOW = 48 * 3600       # ... (LTF H1)
 TP_EXTENSION_PCT = 50               # TP3 : bord opposé du range + 50 % de sa taille (tous les actifs)
@@ -165,13 +171,13 @@ class Deriv:
         return msg.get("candles") if msg else None
 
 
-def get_candles(api, cache, symbol, gran, force=False):
+def get_candles(api, cache, symbol, gran, force=False, count=COUNT):
     """Cache : on ne re-télécharge que si la dernière bougie est clôturée."""
     key = f"{symbol}_{gran}"
     c = cache.get(key)
     if c and not force and time.time() < c[-1]["epoch"] + gran:
         return c
-    fresh = api.candles(symbol, gran)
+    fresh = api.candles(symbol, gran, count=count)
     if fresh:
         cache[key] = fresh
         return fresh
@@ -217,9 +223,12 @@ def aggregate_ny(h1, hours):
 
 
 def tf_candles(api, cache, sym, tf, force=False):
-    if NY_ALIGNED and not is_247(sym) and tf in ("D1", "H4"):
-        h1 = get_candles(api, cache, sym, GRAN["H1"])
-        return aggregate_ny(h1, 24 if tf == "D1" else 4) if h1 else None
+    if NY_ALIGNED and not is_247(sym) and tf in ("D1", "H4", "H1"):
+        # tous les accès H1 de ces actifs utilisent le même historique long (cache cohérent)
+        h1 = get_candles(api, cache, sym, GRAN["H1"], force=force and tf == "H1", count=COUNT_H1_NY)
+        if not h1 or tf == "H1":
+            return h1
+        return aggregate_ny(h1, 24 if tf == "D1" else 4)
     return get_candles(api, cache, sym, GRAN[tf], force=force)
 
 
@@ -424,13 +433,14 @@ def build_trade(sym, sw, bos, price):
     """Entrée, SL, TP1-TP3, type d'ordre et R:R. Retourne None si le setup est ignoré."""
     d, rng, m, j = sw["dir"], sw["range"], bos["m"], bos["j"]
     buy, synth = d == "BUY", is_synthetic(sym)
+    zone = None
     if synth:   # indices synthétiques : entrée immédiate à la clôture de la bougie de cassure
         entry, how = m[j]["close"], "clôture de la cassure"
     else:
         z = entry_zone(m, j, d)
         if not z:
             return None  # aucun OB, Breaker ni FVG : setup ignoré
-        how, entry = z[0], z[1]
+        how, entry, zone = z[0], z[1], z[2]
     hi, lo = rng["high"], rng["low"]
     ext = sw["sl"]  # extrême de la bougie de sweep (MTF)
     buf = max(ext * STOP_LOSS_BUFFER_PCT / 100, SL_BUFFER_ATR * sw.get("atr", 0))
@@ -448,8 +458,9 @@ def build_trade(sym, sw, bos, price):
     ote = in_ote(sw, m, entry, d)
     if rr < MIN_RISK_REWARD or (REQUIRE_FIB_OTE and not ote):
         return None
+    inval = None if zone is None else (zone[0] if buy else zone[1])   # bord de la zone d'entrée côté stop
     return {"otype": order_type(d, entry, price), "entry": entry, "how": how, "sl": sl,
-            "tp1": tp1, "tp2": tp2, "tp3": tp3, "rr": rr, "ote": ote}
+            "tp1": tp1, "tp2": tp2, "tp3": tp3, "rr": rr, "ote": ote, "zone": zone, "inval": inval}
 
 
 def decimals(cs, cap=6):
@@ -475,22 +486,51 @@ def code(x, dec=None):
     return f"<code>{fmt(x, dec)}</code>"
 
 
-def notify(text, html=False):
+def tg_api(method, payload=None, files=None):
+    """Appel à l'API Telegram ; retourne le JSON de la réponse ou None en cas d'échec."""
+    if not (TG_TOKEN and TG_CHAT):
+        return None
+    try:
+        if files:
+            r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/{method}", data=payload, files=files, timeout=30)
+        else:
+            r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/{method}", json=payload, timeout=15)
+        if not r.ok:
+            print(f"Telegram {method} erreur {r.status_code}: {r.text[:150]}")
+            return None
+        return r.json()
+    except Exception as e:
+        print(f"Telegram injoignable ({method}): {str(e)[:100]}")
+        return None
+
+
+def notify(text, html=False, buttons=None):
+    """Envoie un message ; retourne son identifiant (None si l'envoi échoue ou sans secrets Telegram)."""
     if not (TG_TOKEN and TG_CHAT):
         print("ATTENTION : TELEGRAM_TOKEN ou TELEGRAM_CHAT_ID vide -> message NON envoyé :")
-        print(text); return
+        print(text)
+        return None
     payload = {"chat_id": TG_CHAT, "text": text}
     if html:
         payload["parse_mode"] = "HTML"
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json=payload, timeout=15,
-        )
-        if not r.ok:
-            print(f"Telegram erreur {r.status_code}: {r.text[:150]}")
-    except Exception as e:
-        print(f"Telegram injoignable: {str(e)[:100]}")
+    if buttons:
+        payload["reply_markup"] = {"inline_keyboard": buttons}
+    r = tg_api("sendMessage", payload)
+    return r["result"]["message_id"] if r and r.get("ok") else None
+
+
+def notify_photo(path, caption, html=True, buttons=None):
+    """Envoie une image avec légende (1024 caractères au plus) ; retourne l'identifiant du message ou None."""
+    if not (TG_TOKEN and TG_CHAT):
+        return None
+    payload = {"chat_id": TG_CHAT, "caption": caption}
+    if html:
+        payload["parse_mode"] = "HTML"
+    if buttons:
+        payload["reply_markup"] = json.dumps({"inline_keyboard": buttons})
+    with open(path, "rb") as f:
+        r = tg_api("sendPhoto", payload, files={"photo": f})
+    return r["result"]["message_id"] if r and r.get("ok") else None
 
 
 def ratio_txt(d, entry, sl, tp):
@@ -503,12 +543,25 @@ def ratio_txt(d, entry, sl, tp):
 
 
 def mgmt_line():
-    if T.PARTIAL_AT_TP1 > 0 and T.BE_AT_TP1:
-        return f"Gestion : {int(T.PARTIAL_AT_TP1 * 100)} % à TP1, puis SL à l'entrée, le reste vise TP2"
-    return None
+    """Règle de gestion annoncée dans l'alerte (reflète les réglages de tracker.py)."""
+    p1, p2 = T.PARTIAL_AT_TP1, T.PARTIAL_AT_TP2
+    parts = []
+    if p1:
+        parts.append(f"{int(p1 * 100)} % à TP1" + (" (SL à l'entrée)" if T.BE_AT_TP1 else ""))
+    if p2:
+        parts.append(f"{int(p2 * 100)} % à TP2" + (" (SL à TP1)" if T.LOCK_AT_TP2 else ""))
+    rest = round((1 - p1 - p2) * 100)
+    if rest > 0:
+        parts.append(f"{rest} % vers " + ("TP3" if p2 else "TP2"))
+    if not parts:
+        return None
+    out = "Gestion : " + ", ".join(parts)
+    exits = (["structure cassée"] if T.STRUCT_EXIT else []) + \
+            ([f"TP1 non atteint en {T.TIME_STOP_BARS} bougies"] if T.TIME_STOP_BARS else [])
+    return out + (". Sortie si " + " ou ".join(exits) if exits else "")
 
 
-def crt_message(sym, ltf_n, session, price, sw, poi, t, dec=None):
+def crt_message(sym, ltf_n, session, price, sw, poi, t, dec=None, liq=None):
     c = lambda v: code(v, dec)
     d, r = sw["dir"], sw["range"]
     lines = [
@@ -528,6 +581,12 @@ def crt_message(sym, ltf_n, session, price, sw, poi, t, dec=None):
         lines.append(f"✅ OB  {c(poi['ob'][0])} - {c(poi['ob'][1])}")
     if t["ote"]:
         lines.append("✅ OTE (61,8-79 %)")
+    if liq and liq["swept"]:
+        lines.append(f"✅ Liquidité prise : {', '.join(liq['swept'])}")
+    if liq and liq.get("opp") is not None:
+        lines.append(f"Liquidité opposée  {c(liq['opp'])}")
+    if T.STRUCT_EXIT and t.get("inval") is not None:
+        lines.append(f"Invalidation  {c(t['inval'])}  (clôture au-delà = sortie)")
     extra = [x for x in (G.lot_line(sym, t["entry"], t["sl"]), mgmt_line()) if x]
     if extra:
         lines += [""] + extra
@@ -539,7 +598,9 @@ def crt_message(sym, ltf_n, session, price, sw, poi, t, dec=None):
 # --------------------------------------------------------------------------
 def trade_event_message(t, e):
     c = lambda v: code(v, t.get("dec"))
-    head = f"{t['name']} · {t['ltf']} · {t['bot']}"
+    head = f"{t['name']} · {t['ltf']} · {t['bot']}" + (f" #{t['id']}" if t.get("id") else "")
+    closed = t["status"] == "closed" and t.get("r") is not None
+    res = f"\nRésultat  {t['r']:+.1f} R" if closed else ""
     if e == "filled":
         return f"▶️ Ordre touché · {t['otype']} · {head}\nEntrée  {c(t['entry'])}"
     if e == "tp1":
@@ -547,11 +608,25 @@ def trade_event_message(t, e):
         return (f"🎯 TP1 atteint · {head}\nClôture de {int(T.PARTIAL_AT_TP1 * 100)} %, {sl_txt}\n"
                 f"TP1  {c(t['tp1'])}")
     if e == "tp2":
-        return f"✅ TP2 atteint · {head}\nRésultat  {t['r']:+.1f} R"
+        if closed:
+            return f"✅ TP2 atteint · {head}{res}"
+        lock = f"SL remonté à {c(t['sl_now'])}" if T.LOCK_AT_TP2 else "SL inchangé"
+        return (f"🎯 TP2 atteint · {head}\nClôture de {int(T.PARTIAL_AT_TP2 * 100)} %, {lock}, le reste vise TP3\n"
+                f"TP2  {c(t['tp2'])}")
+    if e == "tp3":
+        return f"🏁 TP3 atteint · {head}{res}"
     if e == "sl":
-        return f"❌ Stop touché · {head}\nRésultat  {t['r']:+.1f} R"
+        return f"❌ Stop touché · {head}{res}"
     if e == "be":
-        return f"➖ Stop à l'entrée touché après TP1 · {head}\nRésultat  {t['r']:+.1f} R"
+        return f"➖ Stop à l'entrée touché après TP1 · {head}{res}"
+    if e == "lock":
+        return f"🔒 Stop remonté touché après TP2 · {head}{res}"
+    if e == "struct":
+        return (f"🔻 Structure cassée · {head}\nUne bougie a clôturé au-delà de {c(t['inval'])}. "
+                f"Ferme la position.{res}")
+    if e == "time":
+        return (f"⏱ Sortie au temps · {head}\nTP1 non atteint en {T.TIME_STOP_BARS} bougies. "
+                f"Ferme la position.{res}")
     why = {"cancel_tp": "TP1 atteint sans exécution",
            "cancel_sl": "stop-loss franchi avant exécution",
            "expired": f"ordre expiré ({t['ttl'] // 3600} h sans exécution)"}[e]
@@ -559,7 +634,7 @@ def trade_event_message(t, e):
 
 
 def track_trades(api, tr, bot, now):
-    """Met à jour les trades du bot : exécution, TP1, TP2, stop, annulation, expiration."""
+    """Met à jour les trades du bot : exécution, TP1 à TP3, stop, sorties, annulation, expiration."""
     for key, t in list(tr["active"].items()):
         if t["bot"] != bot:
             continue
@@ -579,7 +654,8 @@ def track_trades(api, tr, bot, now):
 
 
 def emit_alert(a, tr, g, sent, funnel, now, message):
-    """Contrôles de risque, envoi de l'alerte, puis enregistrement du trade pour le suivi."""
+    """Contrôles de risque, envoi de l'alerte (graphique + boutons Pris / Ignoré), puis enregistrement
+    du trade pour le suivi."""
     sent[a["key"]] = int(now)   # un setup bloqué ou alerté n'est jamais réexaminé
     ok, why = G.risk_check(tr, a["sym"], a["dir"], now)
     if not ok:
@@ -594,12 +670,112 @@ def emit_alert(a, tr, g, sent, funnel, now, message):
                 notify(f"⏸ Alertes en pause : {why}. Reprise à la prochaine journée de trading (17h New York).")
         return False
     funnel["alert"] += 1
-    notify(message, html=True)
+    tid = g["next_id"] = g.get("next_id", 0) + 1
+    text = f"{message}\n\nRéf. #{tid}"
+    buttons = [[{"text": "✅ Pris", "callback_data": f"take:{tid}"},
+                {"text": "❌ Ignoré", "callback_data": f"skip:{tid}"}]]
+    delivered = False
+    if a.get("chart") and os.getenv("CHARTS", "1") != "0" and TG_TOKEN and TG_CHAT:
+        path = f"chart_{tid}.png"
+        try:
+            charts.render(a["chart"], path)
+            if len(text) <= 1000:
+                delivered = notify_photo(path, text, buttons=buttons) is not None
+            else:   # légende trop longue : image avec titre, puis le texte complet avec les boutons
+                delivered = notify_photo(path, text.split("\n")[0]) is not None
+                if delivered:
+                    notify(text, html=True, buttons=buttons)
+        except Exception as ex:
+            print(f"Graphique ignoré : {str(ex)[:100]}")
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    if not delivered:
+        notify(text, html=True, buttons=buttons)
     tr["active"][a["key"]] = T.new_trade(
         a["bot"], a["key"], a["sym"], a["name"], a["dir"], a["otype"], a["entry"], a["sl"],
         a["tp1"], a["tp2"], a["tp3"], a["ltf"], a["gran"], a["dec"], a["cascade"], now, a["ttl"],
-        extra={"age": a.get("age"), "session": a.get("session")})
+        extra={"age": a.get("age"), "session": a.get("session"), "liq": a.get("liq"), "id": tid},
+        inval=a.get("inval"), bar_secs=a["gran"])
     return True
+
+
+# --------------------------------------------------------------------------
+# Interactions Telegram : boutons « Pris / Ignoré » et commandes
+# --------------------------------------------------------------------------
+HELP = ("Commandes :\n/pris N : le trade #N est pris\n/ignore N : le trade #N est ignoré\n"
+        "/r N X : ton résultat réel du trade #N, en R (ex. /r 12 -0.8)\n/bilan : bilan des 30 derniers jours")
+
+
+def _set_taken(tr, tid, taken):
+    t = T.find_trade(tr, tid)
+    if t is None:
+        return None
+    t["taken"] = taken
+    return t
+
+
+def handle_update(u, g, tr, now):
+    cq, msg = u.get("callback_query"), u.get("message")
+    chat = str((cq or {}).get("message", {}).get("chat", {}).get("id") if cq else (msg or {}).get("chat", {}).get("id"))
+    if chat != str(TG_CHAT):
+        return  # on n'écoute que ton chat
+    if cq:
+        action, _, num = (cq.get("data") or "").partition(":")
+        if action in ("take", "skip") and num.isdigit():
+            t = _set_taken(tr, int(num), action == "take")
+            label = "✅ Pris · noté" if action == "take" else "❌ Ignoré · noté"
+            tg_api("answerCallbackQuery", {"callback_query_id": cq["id"],
+                                           "text": label if t else "Trade introuvable (trop ancien ?)"})
+            if t:
+                tg_api("editMessageReplyMarkup", {
+                    "chat_id": TG_CHAT, "message_id": cq["message"]["message_id"],
+                    "reply_markup": {"inline_keyboard": [[{"text": label, "callback_data": "noop"}]]}})
+        else:
+            tg_api("answerCallbackQuery", {"callback_query_id": cq["id"]})
+        return
+    parts = (msg.get("text") or "").strip().split()
+    if not parts or not parts[0].startswith("/"):
+        return
+    cmd, args = parts[0].split("@")[0].lower(), parts[1:]
+    if cmd in ("/pris", "/ignore") and args and args[0].lstrip("#").isdigit():
+        t = _set_taken(tr, int(args[0].lstrip("#")), cmd == "/pris")
+        notify(f"Trade #{args[0].lstrip('#')} noté « {'pris' if cmd == '/pris' else 'ignoré'} »." if t
+               else "Trade introuvable (trop ancien ?).")
+    elif cmd == "/r" and len(args) == 2 and args[0].lstrip("#").isdigit():
+        try:
+            val = float(args[1].replace(",", "."))
+        except ValueError:
+            notify("Format : /r N X, par exemple /r 12 -0.8")
+            return
+        t = _set_taken(tr, int(args[0].lstrip("#")), True)
+        if t:
+            t["own_r"] = val
+            notify(f"Trade #{args[0].lstrip('#')} : ton résultat réel {val:+.2f} R est enregistré.")
+        else:
+            notify("Trade introuvable (trop ancien ?).")
+    elif cmd == "/bilan":
+        notify(T.stats_text(tr, now, days=30))
+    else:
+        notify(HELP)
+
+
+def poll_telegram(g, tr, now):
+    """Lit les boutons et commandes envoyés depuis le dernier scan (réponse sous 5 minutes)."""
+    if not (TG_TOKEN and TG_CHAT):
+        return
+    r = tg_api("getUpdates", {"offset": g.get("tg_offset", 0), "timeout": 0,
+                              "allowed_updates": ["callback_query", "message"]})
+    if not r or not r.get("ok"):
+        return
+    for u in r.get("result", []):
+        g["tg_offset"] = u["update_id"] + 1
+        try:
+            handle_update(u, g, tr, now)
+        except Exception as ex:
+            print(f"Message Telegram ignoré : {str(ex)[:100]}")
 
 
 def check_symbols(api):
@@ -615,6 +791,40 @@ def check_symbols(api):
         print(f"check_symbols ignoré: {e}")
 
 
+def vol_regime_ok(mtf):
+    """Régime de volatilité : ATR rapide / ATR lent du MTF entre VOL_MIN et VOL_MAX.
+    Sans assez d'historique (moins de VOL_SLOW + 1 bougies clôturées), le filtre ne s'applique pas."""
+    cs = mtf[:-1]
+    if len(cs) < VOL_SLOW + 1:
+        return True
+    slow = atr(cs, VOL_SLOW)
+    return slow <= 0 or VOL_MIN <= atr(cs, VOL_FAST) / slow <= VOL_MAX
+
+
+def find_liquidity(sw, provide):
+    """Liquidités prises par la bougie de sweep : plus haut/bas de la veille (PDH/PDL) et equal highs/lows
+    du MTF. Retourne aussi la liquidité opposée (PDL pour une vente, PDH pour un achat)."""
+    d, ext, closed, i, a = sw["dir"], sw["sl"], sw["closed"], sw["i"], sw.get("atr", 0)
+    swept, opp = [], None
+    d1 = provide("D1")
+    if d1 and len(d1) >= 3:
+        prev = d1[-2]
+        if d == "SELL" and ext > prev["high"]:
+            swept.append("PDH")
+        if d == "BUY" and ext < prev["low"]:
+            swept.append("PDL")
+        opp = prev["low"] if d == "SELL" else prev["high"]
+    pre, kind = closed[:i], "high" if d == "SELL" else "low"
+    if len(pre) >= 8 and a > 0:
+        lv = [pre[x][kind] for x in swings(pre, kind, len(pre) - 1)][-6:]
+        for x in range(len(lv)):
+            hit = next((y for y in range(x + 1, len(lv)) if abs(lv[x] - lv[y]) <= EQ_TOL_ATR * a), None)
+            if hit is not None and ((ext > max(lv[x], lv[hit])) if d == "SELL" else (ext < min(lv[x], lv[hit]))):
+                swept.append("EQH" if d == "SELL" else "EQL")
+                break
+    return {"swept": swept, "opp": opp}
+
+
 def scan_symbol(sym, provide, now, sent, funnel, news=(), align=False):
     """Analyse un actif sur toutes les cascades. provide(tf, force=False) renvoie les bougies
     (la dernière est en formation) ou None. Retourne les alertes candidates, D1 en premier.
@@ -628,6 +838,9 @@ def scan_symbol(sym, provide, now, sent, funnel, news=(), align=False):
         if not htf or not mtf:
             continue
         funnel["data"] += 1
+        if not vol_regime_ok(mtf):
+            continue  # volatilité en compression extrême ou en pic : on ne trade pas ce régime
+        funnel["regime"] += 1
         sw = find_sweep(htf, mtf)
         if not sw:
             continue
@@ -657,20 +870,42 @@ def scan_symbol(sym, provide, now, sent, funnel, news=(), align=False):
                f"{sw['range']['epoch']}|{sw['closed'][sw['i']]['epoch']}")
         if key in sent:
             continue
-        if G.blackout(sym, now, news):
+        why = G.blackout(sym, now, news)
+        if why:
             funnel["blackout"] += 1
+            sent[key] = int(now)
+            print(f"Alerte bloquée {display_name(sym)} {sw['dir']} : {why}")
+            continue
+        liq = find_liquidity(sw, provide)
+        if REQUIRE_LIQUIDITY and not liq["swept"]:
+            funnel["liquidity"] += 1
             sent[key] = int(now)
             continue
         dec = decimals(ltf)
         session = killzone(sym, bos["epoch"])
+        rg = sw["range"]
+        lines = [{"y": trade["entry"], "label": "Entrée", "kind": "entry"}, {"y": trade["sl"], "label": "SL", "kind": "sl"},
+                 {"y": trade["tp2"], "label": "TP2", "kind": "tp"},
+                 {"y": trade["tp3"], "label": "TP3", "kind": "tp"}, {"y": sw["sl"], "label": "Sweep", "kind": "sweep"},
+                 {"y": rg["high"], "label": "Range H", "kind": "range"}, {"y": rg["low"], "label": "Range B", "kind": "range"}]
+        if (trade["tp1"] > trade["entry"]) == (sw["dir"] == "BUY"):   # TP1 encore devant l'entrée
+            lines.append({"y": trade["tp1"], "label": "TP1", "kind": "tp"})
+        zones = [{"lo": poi["fvg"][0], "hi": poi["fvg"][1], "label": "FVG", "kind": "fvg"}]
+        if poi["ob"]:
+            zones.append({"lo": poi["ob"][0], "hi": poi["ob"][1], "label": "OB", "kind": "ob"})
+        if trade["zone"]:
+            zones.append({"lo": trade["zone"][0], "hi": trade["zone"][1], "label": trade["how"], "kind": "entry"})
+        chart = {"title": f"{display_name(sym)} · {trade['otype']} · {ltf_n} · CRT", "dec": dec,
+                 "candles": charts.candles_slice(ltf), "lines": lines, "zones": zones}
         out.append({
             "bot": "CRT", "key": key, "cascade": f"{htf_n}>{mtf_n}>{ltf_n}", "sym": sym,
             "name": display_name(sym), "dir": sw["dir"], "ltf": ltf_n, "gran": GRAN[ltf_n],
             "dec": dec, "price": price, "otype": trade["otype"], "entry": trade["entry"],
             "sl": trade["sl"], "tp1": trade["tp1"], "tp2": trade["tp2"], "tp3": trade["tp3"],
-            "rr": trade["rr"], "session": session, "age": None,
+            "rr": trade["rr"], "session": session, "age": None, "inval": trade["inval"],
+            "liq": "+".join(liq["swept"]) or "aucune", "chart": chart,
             "ttl": PENDING_TTL_FAST if ltf_n in ("M5", "M15") else PENDING_TTL_SLOW,
-            "message": crt_message(sym, ltf_n, session, price, sw, poi, trade, dec)})
+            "message": crt_message(sym, ltf_n, session, price, sw, poi, trade, dec, liq)})
     return out
 
 
@@ -698,13 +933,16 @@ def main():
         return
     now = time.time()
     cache, state = load(CACHE_FILE), load(STATE_FILE)
-    tr, g, news = T.load_trades(), G.load_guard(), G.load_news()
+    tr, g = T.load_trades(), G.load_guard()
+    news = G.load_news() + G.calendar_events(g, now)
     api, funnel = Deriv(), Counter()
     scanned = 0
     if not (TG_TOKEN and TG_CHAT):
         print("ATTENTION : secret Telegram manquant ou vide (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID)")
     try:
         G.health_start(g, "CRT", now, notify)
+        G.fomc_check(g, now, notify)
+        poll_telegram(g, tr, now)
         check_symbols(api)
         track_trades(api, tr, "CRT", now)
         for sym in SYMBOLS:
