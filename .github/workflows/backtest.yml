@@ -3,11 +3,11 @@ on:
   workflow_dispatch:
     inputs:
       sym:
-        description: "Actif (ex. R_75, frxEURUSD, cryBTCUSD)"
+        description: "Actif(s), séparés par des virgules (ex. R_75 ou R_50,R_75,R_100 ou frxEURUSD)"
         default: "R_75"
       days:
         description: "Jours d'historique M5 à rejouer"
-        default: "60"
+        default: "90"
       strategy:
         description: "Stratégie"
         type: choice
@@ -16,10 +16,16 @@ on:
       spread_pct:
         description: "Spread aller-retour en % du prix (0 = sans coût)"
         default: "0"
+      split:
+        description: "Séparer en deux périodes pour tester la stabilité (ex. 0.6, vide = non)"
+        default: "0.6"
+      grid:
+        description: "Grille facultative, réglages séparés par des points-virgules (ex. tracker.STRUCT_EXIT=true,false;tracker.PARTIAL_AT_TP2=0,0.25)"
+        default: ""
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -27,11 +33,21 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - run: python backtest.py --sym "$SYM" --days "$DAYS" --strategy "$STRATEGY" --spread-pct "$SPREAD" --telegram
+      - name: Backtest
         env:
           SYM: ${{ github.event.inputs.sym }}
           DAYS: ${{ github.event.inputs.days }}
           STRATEGY: ${{ github.event.inputs.strategy }}
           SPREAD: ${{ github.event.inputs.spread_pct }}
+          SPLIT: ${{ github.event.inputs.split }}
+          GRID: ${{ github.event.inputs.grid }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          args=(--sym "$SYM" --days "$DAYS" --strategy "$STRATEGY" --spread-pct "$SPREAD" --telegram)
+          if [ -n "$SPLIT" ]; then args+=(--split "$SPLIT"); fi
+          if [ -n "$GRID" ]; then
+            IFS=';' read -ra sets <<< "$GRID"
+            for s in "${sets[@]}"; do args+=(--set "$s"); done
+          fi
+          python backtest.py "${args[@]}"
