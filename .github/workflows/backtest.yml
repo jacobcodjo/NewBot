@@ -1,66 +1,25 @@
-name: CRT Backtest
+name: Backtest
 on:
   workflow_dispatch:
     inputs:
-      strategy:
-        description: "Stratégie : crt (45 jours max) ou impulse (16 jours max)"
-        type: choice
-        options:
-          - crt
-          - impulse
-        default: crt
-      trend_mode:
-        description: "Lecture de tendance : structure (précoce), deplacement (structure + cassure impulsive), swings (3 swings + SMA 50) ou all (comparaison des trois)"
-        type: choice
-        options:
-          - structure
-          - deplacement
-          - swings
-          - all
-        default: structure
-      crt_mode:
-        description: "CRT : all (compare les 5 variantes), loose (mode historique), ote / mid / ote_confirm (CRT strict, C2 clôturée), session (Asie/Londres/New York, forex et or). Ignoré pour l'Impulsion"
-        type: choice
-        options:
-          - all
-          - loose
-          - ote
-          - mid
-          - ote_confirm
-          - session
-        default: all
-      session_schedule:
-        description: "Horaires du CRT par sessions : normal (sessions réelles du forex) ou killzone (Asie 20h-00h, Londres 2h-5h, New York 7h-12h, heure de New York)"
-        type: choice
-        options:
-          - normal
-          - killzone
-        default: normal
-      ny_aligned:
-        description: "CRT : D1 et H4 avec ouverture à 17h New York pour le forex et l'or (reconstruits depuis le H1)"
-        type: boolean
-        default: false
-      portfolio:
-        description: "Applique a posteriori les limites de risque et de corrélation du bot, tous symboles confondus"
-        type: boolean
-        default: false
-      sensitivity:
-        description: "CRT : analyse de sensibilité (une seule variante, pas « all ») : les paramètres varient un à un"
-        type: boolean
-        default: false
+      sym:
+        description: "Actif (ex. R_75, frxEURUSD, cryBTCUSD)"
+        default: "R_75"
       days:
-        description: "Durée rejouée en jours"
-        default: "30"
-      symbols:
-        description: "Symboles séparés par des virgules (vide = tous)"
-        default: ""
-concurrency:
-  group: crt-backtest
-  cancel-in-progress: false
+        description: "Jours d'historique M5 à rejouer"
+        default: "60"
+      strategy:
+        description: "Stratégie"
+        type: choice
+        options: [auto, crt, impulse]
+        default: auto
+      spread_pct:
+        description: "Spread aller-retour en % du prix (0 = sans coût)"
+        default: "0"
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -68,12 +27,11 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - env:
-          CRT_SESSION_SCHEDULE: ${{ github.event.inputs.session_schedule }}
-          FLAGS: ${{ format('{0}{1}{2}', github.event.inputs.ny_aligned == 'true' && ' --ny-aligned' || '', github.event.inputs.portfolio == 'true' && ' --portfolio' || '', github.event.inputs.sensitivity == 'true' && ' --sensitivity' || '') }}
-        run: python backtest.py --strategy "${{ github.event.inputs.strategy }}" --trend-mode "${{ github.event.inputs.trend_mode }}" --crt-mode "${{ github.event.inputs.crt_mode }}" --days "${{ github.event.inputs.days }}" --symbols "${{ github.event.inputs.symbols }}" $FLAGS
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: backtest-${{ github.event.inputs.strategy }}
-          path: backtest_*.csv
+      - run: python backtest.py --sym "$SYM" --days "$DAYS" --strategy "$STRATEGY" --spread-pct "$SPREAD" --telegram
+        env:
+          SYM: ${{ github.event.inputs.sym }}
+          DAYS: ${{ github.event.inputs.days }}
+          STRATEGY: ${{ github.event.inputs.strategy }}
+          SPREAD: ${{ github.event.inputs.spread_pct }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}

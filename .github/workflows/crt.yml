@@ -13,27 +13,6 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      TREND_MODE: ${{ vars.TREND_MODE }}   # variable de dépôt facultative : structure (défaut), deplacement ou swings
-      # variables de dépôt facultatives (voir README) ; vides = valeurs par défaut du code
-      NY_ALIGNED: ${{ vars.NY_ALIGNED }}
-      CRT_BLOCK_COUNTER_TREND: ${{ vars.CRT_BLOCK_COUNTER_TREND }}
-      CRT_REQUIRE_KILLZONE: ${{ vars.CRT_REQUIRE_KILLZONE }}
-      CRT_MODE: ${{ vars.CRT_MODE }}
-      CRT_STRICT_ENTRY: ${{ vars.CRT_STRICT_ENTRY }}
-      CRT_SESSION_SCHEDULE: ${{ vars.CRT_SESSION_SCHEDULE }}
-      CRT_OBSTACLE_MODE: ${{ vars.CRT_OBSTACLE_MODE }}
-      CRT_HOLIDAY_FILTER: ${{ vars.CRT_HOLIDAY_FILTER }}
-      CRT_NEWS_FEED: ${{ vars.CRT_NEWS_FEED }}
-      CRT_HEARTBEAT_HOUR: ${{ vars.CRT_HEARTBEAT_HOUR }}
-      CRT_TRADE_NOTIFICATIONS: ${{ vars.CRT_TRADE_NOTIFICATIONS }}
-      CRT_SPREAD_SCALE: ${{ vars.CRT_SPREAD_SCALE }}
-      CRT_REQUIRE_FVG: ${{ vars.CRT_REQUIRE_FVG }}
-      CRT_REQUIRE_HTF_POI: ${{ vars.CRT_REQUIRE_HTF_POI }}
-      CRT_NEWS_FILTER: ${{ vars.CRT_NEWS_FILTER }}
-      CRT_CORRELATION_MODE: ${{ vars.CRT_CORRELATION_MODE }}
-      ACCOUNT_BALANCE: ${{ vars.ACCOUNT_BALANCE }}
-      RISK_PCT: ${{ vars.RISK_PCT }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -47,9 +26,8 @@ jobs:
             cache.json
             state.json
             impulse_state.json
-            trade_stats.json
-            trade_stats_impulse.json
-            weekly_outlook_state.json
+            trades.json
+            guard.json
           key: crt-state-${{ github.run_id }}
           restore-keys: crt-state-
       - run: python bot.py
@@ -57,15 +35,13 @@ jobs:
           NOTIFY_OK: ${{ github.event.inputs.test == 'true' && '1' || '0' }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ACCOUNT_BALANCE: ${{ vars.ACCOUNT_BALANCE }}
+          RISK_PCT: ${{ vars.RISK_PCT }}
       - run: python impulse.py
         if: always()
         env:
           NOTIFY_OK: ${{ github.event.inputs.test == 'true' && '1' || '0' }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      - run: python outlook.py
-        if: always()
-        env:
-          NOTIFY_OK: ${{ github.event.inputs.test == 'true' && '1' || '0' }}
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ACCOUNT_BALANCE: ${{ vars.ACCOUNT_BALANCE }}
+          RISK_PCT: ${{ vars.RISK_PCT }}
