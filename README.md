@@ -1,262 +1,136 @@
 # Crt-Bot : alertes CRT et Impulsion (Deriv + Telegram)
 
-Deux scripts Python qui analysent les bougies de l'API Deriv et envoient des alertes Telegram. Ils n'exécutent aucun ordre : tu places toi-même l'ordre sur ta plateforme.
+Des scripts Python qui analysent les bougies de l'API Deriv et envoient des alertes Telegram. Ils n'exécutent aucun ordre : tu places toi-même l'ordre sur ta plateforme. Depuis cette version, ils suivent aussi chaque alerte (exécution, TP1, TP2, stop) et savent rejouer les stratégies sur de l'historique.
 
 | Fichier | Rôle |
 |---|---|
-| `bot.py` | Stratégie CRT (Candle Range Trading) sur 11 actifs (forex majeurs, or, cryptos), plus le client Deriv, les notifications et les fonctions partagées avec `impulse.py` |
-| `impulse.py` | Stratégie Impulsion + retracement Fibonacci sur les 18 indices synthétiques |
-| `outlook.py` | Récapitulatif hebdomadaire du biais D1/W1 (repris de pa-bot) |
-| `bias_study.py` | Étude de prédictibilité : la clôture D1 ou W1 prédit-elle la direction de la bougie suivante ? |
-| `tracker.py` | Suivi automatique des trades du CRT (`trade_stats.json`) et de l'Impulsion (`trade_stats_impulse.json`) |
-| `backtest.py` | Backtest du CRT et de l'Impulsion sur l'historique Deriv |
-| `crt.yml` | Workflow GitHub Actions du bot, à placer dans `.github/workflows/crt.yml` |
-| `backtest.yml` | Workflow GitHub Actions du backtest, à placer dans `.github/workflows/backtest.yml` |
-| `bias-study.yml` | Workflow GitHub Actions de l'étude de prédictibilité, à placer dans `.github/workflows/bias-study.yml` |
-| `watchdog.py` | Surveillance du bot : alerte Telegram si le bot ne tourne plus ou échoue (voir « Surveillance ») |
-| `watchdog.yml` | Workflow planifié du watchdog, à placer dans `.github/workflows/watchdog.yml` |
-| `tests.yml` | Workflow GitHub Actions des tests, à placer dans `.github/workflows/tests.yml` |
-| `tests/test_crt.py` | Tests unitaires du CRT et du suivi (données synthétiques, sans réseau) |
+| `bot.py` | Stratégie CRT (Candle Range Trading) sur 12 actifs : 7 paires forex, or, 4 cryptos |
+| `impulse.py` | Stratégie Impulsion + retracement Fibonacci sur 10 Volatility Index |
+| `tracker.py` | Suivi des trades : ordre en attente, position ouverte, résultat en R, statistiques |
+| `guard.py` | Garde-fous : news et horaires, doublons, exposition, perte journalière, lot, santé du bot, bilan |
+| `backtest.py` | Rejoue CRT et Impulsion sur de l'historique M5 |
+| `crt.yml` | Workflow du scan, à placer dans `.github/workflows/crt.yml` |
+| `backtest.yml` | Workflow du backtest, à placer dans `.github/workflows/backtest.yml` |
+| `news.example.json` | Modèle de calendrier de news (à copier en `news.json`) |
 | `requirements.txt` | Dépendances (`websocket-client`, `requests`) |
 
 ## Mise en place
 
-1. Crée un dépôt GitHub. Mets `bot.py`, `impulse.py`, `outlook.py`, `tracker.py`, `backtest.py`, `bias_study.py` et `requirements.txt` à la racine. Pour les workflows, crée les fichiers `.github/workflows/crt.yml` et `.github/workflows/backtest.yml` (« Add file → Create new file », avec ce chemin comme nom) et colle le contenu de `crt.yml` et de `backtest.yml`. Ajoute de même `.github/workflows/bias-study.yml` pour l'étude de prédictibilité, et `.github/workflows/tests.yml` avec le dossier `tests/` pour les tests.
+1. Crée un dépôt GitHub. Mets à la racine : `bot.py`, `impulse.py`, `tracker.py`, `guard.py`, `backtest.py` et `requirements.txt`. Pour les workflows, crée `.github/workflows/crt.yml` et `.github/workflows/backtest.yml` (« Add file → Create new file », avec ce chemin comme nom) et colle le contenu de `crt.yml` et de `backtest.yml`.
 2. Crée un bot Telegram avec @BotFather (`/newbot`) et garde le token.
 3. Envoie un message à ton bot, puis ouvre `https://api.telegram.org/bot<TOKEN>/getUpdates` pour lire ton `chat id` (`"chat":{"id":...}`).
 4. Dans le dépôt : Settings → Secrets and variables → Actions → New repository secret. Crée `TELEGRAM_TOKEN` et `TELEGRAM_CHAT_ID` (noms exacts, dans « Repository secrets »).
 5. Onglet Actions : active les workflows si GitHub le demande.
-6. Test : Actions → CRT Bot → Run workflow, avec « test » coché. Chaque bot envoie un message de contrôle (« Bot CRT OK… » et « Impulsion OK… »). Le message du CRT contient aussi le résumé du suivi des trades. Sans « test », aucun message de contrôle n'est envoyé.
+6. Test : Actions → CRT Bot → Run workflow, avec « test » coché. Chaque bot envoie un message de contrôle avec l'entonnoir de filtres (le CRT ajoute les statistiques). Sans « test », aucun message de contrôle n'est envoyé.
+
+Variables facultatives (Settings → Secrets and variables → Actions → onglet **Variables**) :
+- `ACCOUNT_BALANCE` : solde de ton compte. Avec elle, chaque alerte affiche un lot estimé.
+- `RISK_PCT` : risque par trade en % du solde (1 par défaut).
 
 ### Déclenchement (cron externe)
 
-Le workflow n'a plus de déclencheur `schedule` : il est lancé uniquement par un cron externe (par exemple cron-job.org), ou à la main depuis l'onglet Actions.
+Le workflow n'a pas de déclencheur `schedule` : il est lancé par un cron externe (par exemple cron-job.org), ou à la main depuis l'onglet Actions.
 
 - Requête POST toutes les 5 minutes vers `https://api.github.com/repos/<COMPTE>/<DEPOT>/actions/workflows/crt.yml/dispatches`
 - Corps : `{"ref":"main"}` (remplace `main` par le nom de ta branche par défaut si besoin)
 - En-têtes : `Authorization: Bearer <TOKEN>`, `Accept: application/vnd.github+json` et `X-GitHub-Api-Version: 2022-11-28`
 - Le token est un jeton « fine-grained » limité à ce dépôt, avec la permission « Actions : lecture et écriture ». Il a une date d'expiration : note-la pour le renouveler.
-- Réponse attendue : `204` (aucun contenu). `401` ou `403` : token ou permission incorrects. `404` : mauvais compte, dépôt ou nom de fichier. `422` : branche inexistante ou workflow sans `workflow_dispatch`.
-- Les exécutions sont mises en file d'attente (une seule à la fois). Si un scan dure plus de 5 minutes, le suivant attend.
+- Réponse attendue : `204`. `401` ou `403` : token ou permission incorrects. `404` : mauvais compte, dépôt ou nom de fichier. `422` : branche inexistante ou workflow sans `workflow_dispatch`.
+- Les exécutions sont mises en file d'attente (une seule à la fois).
 
-Attention : 288 exécutions par jour dépassent le quota gratuit des dépôts privés GitHub (à vérifier sur ton compte). Un dépôt public n'a pas cette limite. Sinon, héberge le bot ailleurs avec un cron.
+Attention : 288 exécutions par jour dépassent le quota gratuit des dépôts privés GitHub (à vérifier sur ton compte). Un dépôt public n'a pas cette limite.
 
 ## Source de données Deriv
 
 - Le bot se connecte d'abord à `wss://api.derivws.com/trading/v1/options/ws/public` (sans authentification), avec l'ancien endpoint en secours.
-- Le client limite le débit (0,6 s entre deux requêtes), réessaie avec un délai croissant et se reconnecte en cas de coupure ou de limite atteinte.
+- Le client limite le débit (0,6 s entre deux requêtes), réessaie avec un délai croissant et se reconnecte en cas de coupure.
 - Un cache évite de retélécharger les bougies tant que la dernière n'est pas clôturée.
-- Au démarrage, le log affiche les symboles absents chez Deriv (« Symboles Deriv… »). Les symboles indisponibles sont ignorés.
-- Variables optionnelles : `DERIV_WS_URL` (forcer un endpoint) et `DERIV_APP_ID` (ancien endpoint). Pour les utiliser, ajoute-les dans les blocs `env` du workflow.
+- Au démarrage, le log affiche les symboles absents chez Deriv. Les symboles indisponibles sont ignorés.
+- Variables d'environnement optionnelles : `DERIV_WS_URL`, `DERIV_APP_ID`, et `CRT_SYNTHETIC=1` pour que le CRT scanne aussi les Volatility Index (réservés à l'Impulsion par défaut). Pour les utiliser, ajoute-les dans les blocs `env` du workflow.
 
 ## Stratégie CRT (`bot.py`)
 
-Stratégie et liste d'actifs reprises de l'ancien Crt-Bot. Le client Deriv, le cache, les notifications, les entrées/sorties et les alertes du second bot restent ceux de ce dépôt.
+**Actifs :** EURUSD, GBPUSD, USDJPY, USDCHF, AUDUSD, USDCAD, NZDUSD, l'or (XAUUSD), BTC, ETH, LTC, XRP.
 
-**Répartition par classe d'actifs :** le CRT couvre les forex majeurs, l'or et les cryptos ; l'Impulsion couvre les indices synthétiques. Aucun actif n'est scanné par les deux stratégies.
+**Cascade (Référence → Manipulation et POI → Confirmation) :** D1→H4→H1, H4→H1→M15, H1→M15→M5. Chaque cascade génère ses propres alertes.
 
-**Actifs du CRT (11) :** les six forex majeurs (EURUSD, GBPUSD, USDJPY, USDCHF, AUDUSD, USDCAD), l'or (XAUUSD), BTC, ETH, LTC et XRP. Les paires croisées sans USD (mineures) ne sont plus suivies, ni par le CRT, ni par le récapitulatif hebdomadaire. Pour ajouter NZDUSD, que certains comptent parmi les majeures, ajoute `"frxNZDUSD"` à `SYMBOLS`. La liste est `SYMBOLS` dans `bot.py`. Les indices synthétiques sont dans `SYNTHETIC_SYMBOLS` (même fichier), scannés par `impulse.py`. Pour remettre un indice synthétique dans le CRT, ajoute-le à `SYMBOLS`.
-
-**Principe**
-1. Range de référence : haut/bas de la dernière période **W1** (semaine ISO complète, dérivée des bougies D1), **D1** ou **H4** clôturée.
-2. Sweep de liquidité : une bougie du timeframe de confirmation dépasse le range puis referme dedans. **C2 doit finir dans le range de C1** (`REQUIRE_C2_CLOSE_INSIDE`) : le prix actuel doit être dans le range et aucune clôture du timeframe de confirmation ne doit être ressortie du range depuis le sweep (sinon c'est une vraie cassure, le setup est écarté). Chaque paire référence/confirmation est analysée séparément. Garde-fous du sweep : **un seul côté balayé** (si les deux côtés du range le sont, c'est une outside bar, pas un CRT ; `SKIP_BOTH_SIDES_SWEPT`), **profondeur limitée** de la mèche (`SWEEP_MAX_RANGE_FRAC` : 50 % du range, `SWEEP_MAX_ATR` : 3 ATR ; au-delà c'est une cassure) et **fraîcheur** (`SWEEP_MAX_AGE`, en bougies de confirmation). Le **range de C1** doit mesurer entre 0,6 et 2,5 ATR de son timeframe de référence (`RANGE_MIN_ATR`, `RANGE_MAX_ATR` ; pour le W1, la taille moyenne des 8 dernières semaines).
-
-   | Référence | Confirmation |
-   |---|---|
-   | W1 | H4 |
-   | D1 | H1 |
-   | H4 | M15 |
-
-   Cette répartition (`REFERENCE_CONFIRMATION_MAP`) évite de confirmer un large range sur un timeframe trop fin. Pour désactiver une référence (le W1 par exemple), supprime sa ligne.
-3. Confirmation avancée, calculée sur les bougies clôturées uniquement (la bougie en formation est ignorée, pour éviter les signaux qui disparaissent) : cassure de structure (clôture au-delà du dernier swing, fenêtre `STRUCTURE_SWING_WINDOW`, 1 pour M15 et 2 ailleurs) **impulsive** (corps au moins 1,2 fois le corps moyen, `MSS_REQUIRE_DISPLACEMENT`, `MSS_BODY_MULT`) **et** Fair Value Gap et/ou Order Block. Le FVG doit être créé par le déplacement entre le sweep et la cassure, avec une bougie centrale dirigée et un écart d'au moins 0,1 ATR (`FVG_MIN_ATR_FRAC`) ; l'OB est la dernière bougie opposée **après le sweep** et avant la cassure (même définition pour le filtre et pour l'entrée). `REQUIRE_FVG = True` rend le FVG obligatoire. Sans FVG ni OB, le setup est ignoré. Un setup est aussi ignoré s'il est périmé : depuis la cassure, le prix a déjà touché le SL ou atteint TP1 ; s'il est **mitigé** (l'entrée a déjà été retestée par une bougie clôturée avant la dernière, `SKIP_MITIGATED`) ; ou s'il a **expiré** : l'expansion est attendue pendant C3, donc un ordre n'est valable que jusqu'à la fin de la 3e bougie de référence depuis l'ouverture de C1 (`EXPIRY_REF_CANDLES`, le W1 compte en semaines, le D1 en jours, le H4 en 4 heures). La date d'expiration figure dans l'alerte et pilote l'expiration de l'ordre dans le suivi.
-4. Une seule alerte par range de référence, par timeframe de confirmation et par sens : le premier setup confirmé verrouille le range jusqu'à la bougie de référence suivante. Un second contrôle sur le contenu (symbole, sens, entrée, SL, TP2) évite deux messages identiques. Les verrous sont purgés après 30 jours (`STATE_MAX_AGE_DAYS`). Les références W1, D1 et H4 d'un même mouvement étant corrélées, **un seul setup par symbole et par sens** est retenu à chaque scan : la référence la plus haute, puis dans une killzone, puis dans la tendance, puis le meilleur ratio (`select_best`).
-
-**Filtres et indications**
-- **Tendance de fond (D1) :** par défaut, un setup à contre-tendance n'est pas bloqué : la ligne « ⚠️ Contre-tendance (D1) » est ajoutée. `BLOCK_COUNTER_TREND = True` (ou la variable de dépôt `CRT_BLOCK_COUNTER_TREND=1`) l'ignore ; le backtest sépare déjà les résultats contre-tendance pour décider. La lecture de tendance est commune au CRT, à l'Impulsion et au récapitulatif hebdomadaire (voir « Lecture de la tendance » plus bas).
-- **Zone d'intérêt HTF :** si le sweep se fait dans un FVG non comblé de la référence (D1 pour le W1), la ligne « 🎯 Sweep dans un FVG » est ajoutée et le setup passe en priorité dans `select_best`. `REQUIRE_HTF_POI = True` (variable `CRT_REQUIRE_HTF_POI=1`) le rend obligatoire. Réglages : `HTF_FVG_LOOKBACK`, `HTF_FVG_TOL_ATR`.
-- **Premium / discount :** un achat n'est valable que si l'entrée est sous le milieu du range de référence (discount), une vente au-dessus (premium) : sinon TP1 (mi-range) serait déjà derrière l'entrée (`REQUIRE_PREMIUM_DISCOUNT`).
-- **Killzones (heure de New York) :** Asie 20h-00h, Londres 2h-5h, New York 7h-10h et London Close 10h-12h, uniquement pour le forex et l'or. Les cryptos (24/7) ne sont pas filtrées. Par défaut, c'est une indication : la ligne « Session » affiche le nom de la killzone du sweep, ou « hors killzone ». `REQUIRE_KILLZONE_FOR_REAL_MARKETS = True` ignore les sweeps hors killzone, et `KILLZONE_24_7 = True` applique aussi le filtre aux cryptos et indices synthétiques.
-- **Filtre de gap de weekend (forex et or) :** une bougie qui suit un écart de temps anormal n'est jamais comptée comme un sweep (`WEEKEND_GAP_MULTIPLIER`).
-- **Pools de liquidité (equal highs / equal lows) :** si le sweep a balayé un pool détecté, la ligne « 💧 Pool de liquidité balayé » est ajoutée. Si le stop-loss tombe lui-même sur un pool du même côté (creux égaux sous un achat, sommets égaux au-dessus d'une vente), il est écarté d'une marge supplémentaire (`STOP_LOSS_POOL_BUFFER_PCT`). Réglages : `LIQUIDITY_POOL_SWING_WINDOW` et `LIQUIDITY_POOL_TOLERANCE_PCT`.
-- **D1 et H4 :** bougies natives de Deriv par défaut. `NY_ALIGNED = True` (ou la variable de dépôt `NY_ALIGNED=1`) recalcule D1 et H4 depuis 1500 bougies H1 (`H1_LONG_COUNT`, environ 60 jours) avec une ouverture à 17h New York (forex et or) ; la semaine W1 est alors calée sur la même ouverture. Le backtest le reproduit avec `--ny-aligned` (D1 et H4 reconstruits depuis le H1, 75 jours de recul).
-- **Rollover (forex et or) :** aucune alerte entre 16h45 et 17h30 heure de New York, quand les spreads s'élargissent (`ROLLOVER_FILTER`, `ROLLOVER_NY`).
-- **News (forex, or et cryptos) :** aucune alerte dans les 30 minutes autour d'une annonce touchant une devise du symbole (les annonces USD concernent aussi les cryptos, `NEWS_INCLUDE_CRYPTO`) (`NEWS_FILTER`, `NEWS_BLOCK_BEFORE_MIN`, `NEWS_BLOCK_AFTER_MIN`). Le NFP (premier vendredi du mois, 8h30 New York) est automatique ; pour FOMC, CPI, BCE, etc., deux options : un fichier `news.json` à la racine du dépôt (saisie manuelle), par exemple `[{"time": "2026-11-04T19:00:00Z", "currencies": ["USD"]}]` (heure UTC), ou le **flux d'annonces** `CRT_NEWS_FEED=1`, qui lit les annonces à fort impact du calendrier économique public (`NEWS_FEED_URL`, relu au plus toutes les 6 h ; en cas d'échec le bot garde les événements connus et réessaie 30 minutes plus tard). **Ce flux n'a pas pu être testé contre le service réel** : vérifie dans les logs qu'il se charge avant de t'y fier, et garde `news.json` en secours. Un setup retenu pendant une annonce n'est pas verrouillé : il est envoyé après la fenêtre s'il est toujours valide. Pour un trade **déjà ouvert**, un message d'avertissement part une heure avant l'annonce (`NEWS_WARN_MIN`) : sécuriser (SL au point d'entrée) ou réduire.
-- **Jours fériés (forex et or) :** aucune alerte les jours fériés qui assèchent le marché : Nouvel an, Noël, Vendredi saint, Lundi de Pâques et Boxing Day, fériés britanniques (bank holidays de mai et d'août, date de Londres) et américains (MLK, Presidents, Memorial, Juneteenth, 4 juillet, Labor, Thanksgiving ; date de New York). Les reports lorsqu'un férié tombe un week-end, Columbus Day, Veterans Day et les fériés japonais ne sont pas gérés : ajoute-les dans `holidays.json` (`["2026-12-24", {"date": "2027-01-04", "name": "Tokyo"}]`, jour entier en date UTC). `CRT_HOLIDAY_FILTER=0` désactive le filtre ; les cryptos ne sont pas concernées.
-- **Obstacles entre l'entrée et TP2 :** le plus haut et le plus bas de la veille (PDH, PDL) et de la semaine précédente (PWH, PWL), et le bord proche des FVG D1 opposés non comblés (une vente rencontre une demande, un achat une offre). `CRT_OBSTACLE_MODE=flag` (défaut) ajoute la ligne « 🚧 Obstacle avant TP2 » avec le R:R jusqu'à l'obstacle ; `cap` plafonne TP2 au premier obstacle situé après TP1 (l'ancien TP2 devient TP3, le ratio minimum s'applique) et ignore le setup si un obstacle précède TP1 ; `off` désactive. Les sommets et creux de session ne sont pas pris en compte.
-- **Limites de risque :** les nouvelles alertes sont suspendues (un message par motif et par jour, sans verrouiller les setups) si 6 trades sont exposés (`MAX_OPEN_TRADES` ; un trade qui a atteint TP1 est supposé sécurisé par le SL au point d'entrée et n'est plus compté, `COUNT_PROTECTED_TRADES = True` les compte), si les trades résolus du jour cumulent -3 R géré (`MAX_DAILY_LOSS_R`) ou ceux de la semaine -6 R (`MAX_WEEKLY_LOSS_R`, jours et semaines en heure de New York). `--portfolio` les applique a posteriori dans le backtest.
-- **Corrélation :** les forex et l'or sont regroupés par côté du dollar (acheter EURUSD ou l'or = vendre le dollar), les cryptos par sens. Si au moins 2 trades exposés (`MAX_CORRELATED_OPEN`) sont déjà ouverts ou en attente sur le même côté, l'alerte porte la ligne « ⚠️ Corrélation » ; `CRT_CORRELATION_MODE=block` retient l'alerte tant que l'exposition est pleine.
+**Règles**
+1. Le range est la dernière bougie clôturée du timeframe de référence. Il doit mesurer entre 0,5 et 3 ATR du timeframe de référence (`RANGE_MIN_ATR`, `RANGE_MAX_ATR`) : cela écarte les inside bars et les bougies d'actualité géantes.
+2. Sweep (MTF) : une bougie dépasse le range puis referme dedans. Une bougie qui dépasse les deux côtés est ignorée (sens ambigu). Si le prix clôture ensuite au-delà de l'extrême du sweep, ce sweep est invalidé et le bot cherche un sweep ultérieur.
+3. POI (MTF) : un FVG formé après le sweep, avec une bougie centrale d'au moins 1,5 fois le corps moyen, situé dans la bonne moitié du range (premium pour une vente, discount pour un achat). L'OB éventuel doit être dans la même moitié et ne peut pas être la bougie de sweep.
+4. Confirmation (LTF) : le prix touche le POI, puis une clôture casse le dernier swing (fractale de 2 bougies de chaque côté), avec un corps d'au moins 1,2 fois le corps moyen. La cassure doit dater des 2 dernières bougies.
+5. Killzones (heure de New York) : Asie 20h-00h, Londres 02h-05h, New York 07h-10h, London Close 10h-12h. Les cryptos ne sont pas filtrées.
+6. Pour le forex et l'or, D1 et H4 sont recalculés depuis le H1 avec une ouverture à 17h New York.
 
 **Entrées et sorties**
-- **Entrée, marchés réels (forex, or, cryptos) :** au niveau de la cassure de structure, par ordre de priorité : Order Block (dernière bougie opposée avant le mouvement, à 8 bougies au plus de la cassure), sinon Breaker Block, sinon milieu du FVG. Pour l'OB et le Breaker, le niveau est le bord que le prix atteint en premier (le haut pour un achat, le bas pour une vente). Si aucun des trois n'existe, le setup est ignoré.
-- **Entrée, indices synthétiques (inactive tant qu'aucun n'est dans `SYMBOLS`) :** immédiate, à la clôture de la bougie de cassure de structure. Ces actifs enchaînent souvent des mouvements directs sans revenir sur la zone, où un ordre en attente resterait non rempli.
-- **Stop-loss :** au-delà de l'extrême de la bougie de sweep, avec une marge égale au plus grand de 0,05 % du prix (`STOP_LOSS_BUFFER_PCT`) et de 0,15 ATR du timeframe de confirmation (`STOP_LOSS_BUFFER_ATR`), plus un spread estimé (`SPREAD_PCT` : 0,003 % forex, 0,015 % or, 0,04 % cryptos ; à ajuster selon ton courtier).
-- **Taille de position :** si la variable de dépôt `ACCOUNT_BALANCE` est renseignée, l'alerte ajoute la ligne « 💼 Taille » pour risquer `RISK_PCT` % (défaut 1) du capital sur la distance au SL. Calcul approximatif : vérifie la taille de contrat chez ton courtier.
-- **Gestion après TP1 :** l'alerte rappelle la règle « la moitié à TP1, SL au point d'entrée, le reste vers TP2 » (`MANAGEMENT_NOTE`). Le suivi et le backtest calculent ce « R géré » en plus du R à TP2.
-- **Cibles (tous les actifs) :** TP1 à mi-range (50 %), TP2 au bord opposé du range de référence, TP3 au bord opposé plus 50 % de la taille du range (`TP_EXTENSION_PCT`).
-- **Ratio :** calculé sur TP2. Une alerte n'est envoyée que si le ratio est d'au moins 1 pour 3 (`MIN_RISK_REWARD`).
-- **Type d'ordre :** déterminé en comparant l'entrée au prix actuel (relevé au moment de l'envoi) : `BUY`/`SELL` si le prix est déjà sur la zone (écart sous `ORDER_TYPE_TOLERANCE_PCT`), sinon `BUY LIMIT`/`SELL LIMIT` ou `BUY STOP`/`SELL STOP`.
-- **OTE :** si l'entrée tombe dans le retracement 61,8-79 % du mouvement impulsif après le sweep, la ligne « ✅ OTE » est ajoutée. Avec `REQUIRE_FIB_OTE = True`, c'est un filtre obligatoire.
-
-Le CRT ne dépend plus des cascades à trois niveaux (`CASCADES`), qui restent dans `bot.py` pour l'Impulsion. Les garde-fous ajoutés après l'analyse du bot (validation de C2, déplacement, FVG/OB stricts, premium/discount, news, SL adaptatif) sont tous des constantes de `bot.py` : chacun se désactive en une ligne. Ils n'ont pas été validés sur l'historique Deriv : lance le backtest avant de t'y fier.
-
-## CRT strict : C2 clôturée, entrée sur C2 (`CRT_MODE`)
-
-Le mode historique (`loose`) entre pendant la formation de C2, dès qu'un sweep, une cassure de structure et un OB/FVG sont confirmés sur le timeframe de confirmation. Le mode **strict** suit le modèle de base à 3 bougies : **C1** est l'avant-dernière bougie de référence clôturée, **C2** la dernière clôturée et **C3** la bougie en formation. Il s'active avec la variable de dépôt `CRT_MODE=strict`, et le mode d'entrée se choisit avec `CRT_STRICT_ENTRY` (défaut : `ote`).
-
-Conditions communes : C2 balaie **un seul** côté de C1 (pas d'outside bar), **clôture dans** le range de C1, sa mèche ne dépasse pas la profondeur maximale (`SWEEP_MAX_RANGE_FRAC`), et C3 n'a pas dépassé l'extrême de C2 (sinon la thèse est invalidée). Le range de C1 doit mesurer entre 0,6 et 2,5 ATR (`RANGE_MIN_ATR`, `RANGE_MAX_ATR`). TP1 est au milieu de C1, TP2 à son bord opposé, et l'ordre expire à la fin de C3. Les filtres communs s'appliquent aussi (annonces, rollover, premium/discount, corrélation, limites de risque, zone d'intérêt HTF).
-
-| `CRT_STRICT_ENTRY` | Entrée | Stop-loss |
-| --- | --- | --- |
-| `ote` | Ordre limite à 70,5 % du retracement de C2 (zone OTE 62-79 %, mesurée depuis l'extrême opposé au sweep : une vente est placée près du haut de C2) | Au-delà de l'extrême de C2, marge de 0,05 ATR de la référence plus le spread |
-| `mid` | Ordre limite à 50 % de C2 | Idem |
-| `ote_confirm` | La zone OTE de C2 est touchée pendant C3, puis une cassure de structure impulsive et un OB ou FVG sur le timeframe de confirmation donnent l'entrée (même moteur que le mode historique) | Au-delà du plus haut (ou bas) du retracement, avec la marge adaptative habituelle |
-
-Particularités des deux ordres limites : l'entrée doit rester dans le range de C1 (`STRICT_ENTRY_INSIDE_RANGE`) et du bon côté du milieu (premium pour une vente, discount pour un achat), sinon le setup est ignoré ; si l'entrée a déjà été touchée pendant C3, l'alerte est ignorée (l'ordre aurait été rempli avant). Le R:R minimum (3) s'applique : à 50 %, le stop est plus loin et beaucoup de setups tombent sous ce seuil.
-
-**Limite à connaître :** les ordres limites ne sont remplis que si le prix retrace vers l'entrée. Les expansions de C3 les plus fortes ne reviennent souvent jamais : le taux de remplissage peut être faible et le résultat dépend alors des seuls retracements. Le backtest compare les quatre variantes avec le taux de remplissage et le R net **par alerte** (un ordre jamais rempli compte pour 0), seule mesure qui permet de les comparer équitablement : `python backtest.py --crt-mode all` ou, sur GitHub, le champ « crt_mode » du workflow (valeur par défaut `all`). Réglages : `STRICT_OTE_ZONE`, `STRICT_OTE_LEVEL`, `STRICT_MID_LEVEL`, `STRICT_SL_BUFFER_ATR`.
-
-## CRT par sessions : Asie, Londres, New York (`CRT_MODE=session`)
-
-Variante du CRT où chaque « bougie » est une session (modèle AMD intraday), **réservée au forex et à l'or** : les cryptos tournent en continu et les indices synthétiques n'ont pas de sessions. Elle s'active avec la variable de dépôt `CRT_MODE=session` et utilise le M15 du bot.
-
-- **C1, accumulation (Asie) :** le haut et le bas de la session asiatique forment le range. Il doit mesurer entre 0,15 et 0,7 ATR D1 (`SESSION_RANGE_MIN_ATR_D1`, `SESSION_RANGE_MAX_ATR_D1`) et couvrir au moins 60 % de la session (`SESSION_MIN_COVERAGE`).
-- **C2, manipulation (Londres) :** une bougie M15 balaie un côté du range asiatique pendant la session de Londres et clôture dedans. Les deux côtés balayés = pas de CRT ; le sweep ne doit pas dépasser le range asiatique ni 0,4 ATR D1 (`SESSION_SWEEP_MAX_RANGE_FRAC`, `SESSION_SWEEP_MAX_ATR_D1`). Le prix actuel doit être dans le range et aucune clôture ne doit en être ressortie depuis le sweep.
-- **Entrée :** cassure de structure impulsive après le sweep, puis OB ou FVG (même moteur que le mode historique). SL au-delà de l'extrême du sweep, TP1 au milieu du range asiatique, TP2 à son bord opposé.
-- **C3, distribution (New York) :** l'alerte reste valable pendant la fin de Londres et la session de New York ; l'ordre expire à la fin de la session de New York. La ligne « Session » indique « Londres (manipulation) » ou « New York (distribution) ».
-
-**Horaires (`CRT_SESSION_SCHEDULE`) :**
-
-| Valeur | Asie (accumulation) | Londres (manipulation) | New York (distribution) |
-| --- | --- | --- | --- |
-| `normal` (défaut) | Ouverture de Tokyo (00h00 UTC) jusqu'à 8h00 Londres | 8h00 Londres jusqu'à 8h00 New York | 8h00 à 17h00 New York |
-| `killzone` | 20h00 à 00h00 New York | 2h00 à 5h00 New York | 7h00 à 12h00 New York |
-| `mixed` | Toute la session de Tokyo : 00h00 UTC jusqu'à 2h00 New York | Killzone de Londres : 2h00 à 5h00 New York | Killzone de New York : 7h00 à 12h00 New York |
-
-`mixed` combine un range asiatique complet (plus large, donc des TP2 plus lointains) avec des fenêtres de sweep et d'expiration resserrées. Les heures suivent les changements d'heure de Londres et de New York, y compris pendant les semaines où ils ne changent pas le même jour (testé : le 16 mars et le 28 octobre). Avec `normal` (en été : Asie 00h-07h UTC, Londres 07h-12h, New York 12h-21h ; en hiver : 00h-08h, 08h-13h, 13h-22h). Les week-ends sont ignorés. Les filtres d'annonces (dont le NFP à 8h30 New York, pendant la session de distribution : l'alerte est retenue 30 minutes avant et après), de rollover, de corrélation et de risque s'appliquent comme ailleurs.
-
-**Limites :** un range asiatique étroit donne des TP2 proches (le R:R minimum de 3 écarte beaucoup de setups) ; Londres peut être une vraie tendance et New York peut inverser Londres (le biais D1 est indiqué par la ligne « Contre-tendance ») ; environ 30 sessions par symbole sur 45 jours : très peu de trades pour conclure. Le backtest `--crt-mode all` ajoute cette variante à la comparaison (elle ne concerne que le forex et l'or). Pour comparer les deux horaires, lance le backtest deux fois avec `--crt-mode session` : sur GitHub, le champ « session_schedule » du workflow (`normal` ou `killzone`) ; en local, `CRT_SESSION_SCHEDULE=killzone python backtest.py --crt-mode session`.
-
-## Surveillance, notifications de gestion et exécution
-
-- **Alerte d'erreur :** si une exécution du bot échoue, un message Telegram « ❌ Erreur du bot CRT » donne la cause ; une même erreur n'est renvoyée qu'après 6 heures.
-- **Bilan quotidien :** une fois par jour, à partir de 6h UTC (`CRT_HEARTBEAT_HOUR`, `off` pour désactiver), « ✅ Bot CRT actif » indique la variante, les symboles scannés, les alertes des dernières 24 h et les trades exposés. Son absence signale un arrêt.
-- **Watchdog (`watchdog.yml`) :** workflow planifié toutes les heures, indépendant du déclencheur externe du bot. Il lit les derniers runs de `crt.yml` avec l'API GitHub et alerte sur Telegram si le bot n'a pas tourné depuis 45 minutes, ou si un run a échoué dans la dernière heure. Il utilise les secrets existants `TELEGRAM_TOKEN` et `TELEGRAM_CHAT_ID`. Attention : GitHub désactive les workflows planifiés après 60 jours sans activité dans le dépôt, et peut retarder les exécutions de quelques minutes.
-- **Notifications de gestion** (`CRT_TRADE_NOTIFICATIONS`) : ordre rempli, **TP1 atteint** (« prends la moitié du trade et place le SL au point d'entrée »), trade clos (TP2, retour au point d'entrée après TP1, SL, ordre expiré) avec le R géré.
-- **Exécution :** le bot n'envoie pas d'ordres à un courtier, volontairement : cela exigerait des clés de trading et engagerait de l'argent réel sans validation de la stratégie. Il alerte, tu places l'ordre. Les niveaux viennent du flux Deriv, qui peut différer de ton courtier (le premier message du jour le rappelle) : `CRT_SPREAD_SCALE` ajuste les spreads estimés et `LOT_UNITS` les unités par lot de la ligne « 💼 Taille ».
-
-## Suivi automatique des trades (`tracker.py`)
-
-Chaque alerte est enregistrée dans un fichier de statistiques par stratégie : `trade_stats.json` pour le CRT, `trade_stats_impulse.json` pour l'Impulsion (conservés par le cache du workflow, comme `state.json`).
-- Un ordre au marché (`BUY`/`SELL`) est considéré rempli à l'envoi. Un ordre `LIMIT`/`STOP` doit d'abord être rempli : le prix atteint l'entrée. Un ordre jamais rempli après son délai est archivé « EXPIRE » (fin de C3 pour le CRT, `PENDING_MAX_AGE_DAYS` pour les autres ; 24 h pour l'Impulsion, comme `PENDING_TTL`), sans compter comme gagnant ni perdant, et alimente le taux de remplissage.
-- Une fois rempli, le premier niveau touché décide : **SL** (perdant) ou **cible de gain** (gagnant). La cible est TP2 pour le CRT et TP1 pour l'Impulsion : c'est le niveau sur lequel porte le ratio minimum de 1 pour 3 de chaque stratégie, et le R d'un gain est ce ratio. Pour le CRT, TP1 est noté à part. Si SL et cible sont touchés dans la même bougie, le SL est retenu. Sur la bougie de remplissage, seul le SL est pris en compte. Pour le CRT, le suivi note aussi si le prix est revenu au point d'entrée après TP1 (`be_hit`) et calcule le **R géré** : SL sans TP1 = -1 ; TP1 puis retour à l'entrée = 0,5 x R(TP1) ; TP2 atteint sans retour = 0,5 x R(TP1) + 0,5 x R(TP2).
-- Seules les bougies qui s'ouvrent après l'alerte comptent : aucun résultat n'utilise des prix antérieurs à l'envoi.
-- Les bougies utilisées sont celles du timeframe de confirmation. Chaque trade mémorise la dernière bougie évaluée : il n'a donc pas besoin que l'historique récupéré (200 bougies) remonte jusqu'à son ouverture. Il est archivé « NON_RESOLU » si le bot reste arrêté plus longtemps que cet historique, ou si le trade reste ouvert plus de 30 jours (`TRADE_MAX_OPEN_DAYS`). Ces cas sont comptés à part.
-- Le résumé (réussite globale, R moyen, TP1 atteint pour le CRT, contre-tendance ou non pour le CRT, classe d'actif, zone de retracement pour l'Impulsion, entrée dans l'OTE ou non pour le CRT, référence, taux de remplissage) s'affiche dans les logs à chaque passage et dans le message de test de chaque stratégie. L'historique de plus de 180 jours est purgé (`TRADE_HISTORY_MAX_AGE_DAYS`).
-
-## Backtest (`backtest.py`)
-
-Le script rejoue l'historique Deriv comme le bot l'aurait vu : à chaque clôture de bougie du timeframe de pas (M15 pour le CRT, M5 pour l'Impulsion), il reconstruit les bougies visibles, applique la stratégie, les mêmes verrous anti-doublon et le même suivi. Chaque alerte est ensuite suivie sur les bougies suivantes du timeframe de pas (plus fines que le suivi en direct, donc moins de cas SL et cible dans la même bougie).
-
-- **Sur GitHub :** Actions → CRT Backtest → Run workflow, avec la stratégie (`crt` ou `impulse`), la durée en jours et, si besoin, des symboles séparés par des virgules (par exemple `frxEURUSD,cryBTCUSD` pour le CRT, `R_75,1HZ100V` pour l'Impulsion ; un symbole d'une autre stratégie est refusé). Le résumé s'affiche dans la page de l'exécution et le fichier `backtest_crt.csv` ou `backtest_impulse.csv` (avec les colonnes `tendance`, `age_tendance`, `zone`, `ote` et `mode_tendance`) est téléchargeable dans les artefacts. Le backtest complet des 11 actifs du CRT est rapide, celui des 18 indices de l'Impulsion prend plus de temps (pas de 5 minutes).
-- **Lecture de tendance :** `--trend-mode structure` (défaut), `deplacement`, `swings`, ou `all`, qui rejoue le même historique avec les trois règles et affiche un tableau comparatif (setups, réussite, R moyen, contre-tendance). Le résumé de chaque mode contient un tableau par âge de tendance, et selon la stratégie un tableau par zone de retracement (Impulsion : Golden Zone 50-61,8 % contre OTE 61,8-79 %) ou selon que l'entrée tombe dans l'OTE ou non (CRT). Pour le CRT, la tendance n'est qu'une étiquette : seuls les résultats « contre-tendance » changent. Pour l'Impulsion, c'est un filtre : le nombre de setups change. Sur GitHub, c'est le champ « trend_mode » du workflow.
-- **Variantes CRT :** `--crt-mode loose|ote|mid|ote_confirm|session|all` (défaut : la variante active du bot). `all` rejoue le même historique avec le mode historique, les trois entrées du CRT strict et le CRT par sessions, puis affiche un tableau comparatif : alertes, taux de remplissage, réussite, R net par trade, R géré net et **R net par alerte**. Le CSV contient une colonne `mode_crt`.
-- **En local :** `python backtest.py --strategy impulse --days 14 --symbols R_75,1HZ100V --trend-mode all`
-- **Résultat :** réussite et R moyen (SL = -1, gain = ratio de la cible : TP2 pour le CRT, TP1 pour l'Impulsion), plus TP1 atteint pour le CRT, globalement puis par classe d'actif, référence, tendance (CRT), type d'ordre et sens, plus les meilleurs et pires symboles (5 trades minimum).
-- **Limites :** 5000 bougies par requête Deriv, soit 45 jours au maximum pour le CRT (M15) et 16 jours pour l'Impulsion (M5) : une durée plus longue est ramenée à ce maximum. Le **R net** retranche un coût estimé (spread de `SPREAD_PCT` plus glissement de `SLIPPAGE_PCT`, exprimé en R) ; `--no-costs` le désactive. Pas de commission ni de swap. `--oos 0.3` (défaut) isole les 30 % finaux de la période pour juger la stabilité dans le temps (`--oos 0` pour désactiver) : les paramètres n'étant pas ajustés sur la première partie, un écart important entre les deux signale un résultat fragile. Les bougies D1 et H4 sont celles de Deriv, sauf avec `--ny-aligned`. `--folds 3` (défaut) affiche les résultats par tranches de temps consécutives. `--portfolio` applique a posteriori, tous symboles confondus, le plafond de trades exposés, les limites de perte du jour et de la semaine et le plafond de corrélation (approximation : un trade bloqué n'est pas rejoué plus tard et un trade ouvert est compté comme non sécurisé). `--sensitivity` (une seule variante) rejoue la stratégie en faisant varier ses paramètres un à un (`SENSITIVITY_GRIDS`) : une stratégie robuste varie peu autour de ses valeurs, un résultat qui ne tient que sur une valeur précise est un signe de sur-ajustement (tableau dans `backtest_sensibilite.csv`). Les marchés fermés suivent la même règle qu'en direct. Un backtest sur quelques semaines n'est pas statistiquement concluant et ne garantit rien pour la suite.
+- **Entrée :** au niveau de la cassure de structure LTF, par ordre de priorité : Order Block (dernière bougie opposée avant le mouvement, à 8 bougies LTF au plus de la cassure), sinon Breaker Block, sinon milieu du FVG. Si aucun des trois n'existe, le setup est ignoré. Sur les indices synthétiques (si `CRT_SYNTHETIC=1`), l'entrée est immédiate à la clôture de la cassure.
+- **Stop-loss :** au-delà de l'extrême du sweep, avec une marge d'au moins 0,05 % du prix ou 0,1 ATR MTF si c'est plus grand (`STOP_LOSS_BUFFER_PCT`, `SL_BUFFER_ATR`). La marge s'adapte ainsi à la volatilité de chaque actif.
+- **Cibles :** TP1 à mi-range, TP2 au bord opposé du range, TP3 au bord opposé plus 50 % de la taille du range (`TP_EXTENSION_PCT`).
+- **Ratio :** calculé sur TP2, minimum 1 pour 3 (`MIN_RISK_REWARD`).
+- **Type d'ordre :** `BUY`/`SELL` si le prix est déjà sur la zone (écart sous `ORDER_TYPE_TOLERANCE_PCT`), sinon `BUY LIMIT`/`SELL LIMIT` ou `BUY STOP`/`SELL STOP`.
+- **OTE :** si l'entrée tombe dans le retracement 61,8-79 % du mouvement après le sweep, la ligne « ✅ OTE » est ajoutée. Avec `REQUIRE_FIB_OTE = True`, c'est un filtre obligatoire.
 
 ## Stratégie Impulsion (`impulse.py`)
 
-**Actifs (18) :** tous les indices synthétiques : Volatility 10, 25, 50, 75, 100, leurs variantes 1s (10, 15, 25, 30, 50, 75, 90, 100, 150, 200, 250, 300) et le Step Index (`SYMBOLS` dans `impulse.py`, qui reprend `SYNTHETIC_SYMBOLS` de `bot.py`). Les 8 variantes et le Step Index viennent de l'ancien périmètre du CRT : retire-les de `SYMBOLS` pour revenir aux 10 Volatility Index d'origine. **Cascade (HTF → MTF → LTF) :** D1→H4→H1, H4→H1→M15, H1→M15→M5 (`CASCADES` dans `bot.py`, utilisée uniquement par l'Impulsion).
+**Actifs :** Volatility 10, 25, 50, 75, 100 et leurs variantes 1s. **Cascade :** identique au CRT.
 
 **Règles (écrites pour un achat, la vente est le miroir)**
-1. Tendance (HTF) : haussière selon `bot.trend_info` (voir « Lecture de la tendance » : structure de marché précoce par défaut, structure avec cassure impulsive en mode `deplacement`, ou 3 swings + SMA 50 en mode `swings`). L'âge de la tendance est enregistré dans le suivi et le backtest. Sinon, pas de signal. `STRICT_TREND = False` rétablit l'ancienne règle, encore plus souple : les 2 derniers sommets et creux plus hauts, sans cassure ni SMA.
-2. Impulsion (MTF) : cassure de structure avec déplacement, sur une jambe d'au moins 2 ATR. Le Fibonacci va de l'origine (creux) à l'extrême (plus haut, mèche comprise). Le setup est annulé si une bougie MTF clôture au-delà de 79 % ou si l'origine est reprise.
+1. Tendance (HTF) : dernier sommet et dernier creux plus hauts que les précédents (2 swings suffisent), structure intacte (aucune clôture sous le dernier creux) et dernier sommet dépassé par une clôture (`BOS_BY_CLOSE`). L'âge est classé d'après le nombre de jambes consécutives : 1 = naissante, 2-3 = établie, 4 et plus = mûre (`AGE_ESTABLISHED`, `AGE_MATURE`). Seules les tendances naissantes et établies donnent un signal (`TREND_AGES_OK`).
+2. Impulsion (MTF) : cassure de structure avec déplacement, sur une jambe d'au moins 2 ATR. Le Fibonacci va de l'origine (creux) à l'extrême (plus haut, mèche comprise). Le setup est annulé si une bougie MTF ou LTF clôture au-delà de 79 % ou si l'origine est reprise. L'extrême doit dater de 48 bougies MTF au plus (`IMPULSE_MAX_AGE`).
 3. Zone acceptée : de 50 % à 79 % de la jambe, mesurés à partir de l'extrême.
-4. Entrée (LTF) : le prix touche la zone, balaie un creux LTF formé pendant le retracement (mèche sous le creux, clôture au-dessus), puis casse la structure avec déplacement en laissant un FVG. L'OB est la dernière bougie baissière avant ce déplacement. Il doit chevaucher la zone.
-5. Étiquette : « Golden Zone » si le niveau d'entrée est entre 50 % et 61,8 %, « OTE » entre 61,8 % et 79 %.
-6. SL au-delà de l'extrême du sweep, plus 0,15 ATR. TP1 à l'extrême de l'impulsion, avec un ratio minimum de 1 pour 3. TP2 et TP3 aux extensions 1,272 et 1,618.
+4. Entrée (LTF) : le prix touche la zone, balaie un creux LTF formé pendant le retracement, puis casse la structure avec déplacement en laissant un FVG (bougie centrale d'au moins 1,5 fois le corps moyen, taille d'au moins 0,1 ATR). L'OB est la dernière bougie baissière avant ce déplacement et doit chevaucher la zone. Si plusieurs combinaisons sweep/cassure existent, le bot garde celle qui offre le meilleur ratio.
+5. Étiquette : « Golden Zone » si l'entrée est entre 50 % et 61,8 %, « OTE » entre 61,8 % et 79 %.
+6. SL au-delà de l'extrême du sweep, plus 0,15 ATR. TP1 à l'extrême de l'impulsion, TP2 et TP3 aux extensions 1,272 et 1,618. Le ratio minimum de 1 pour 3 est calculé sur TP2 (`RR_ON = "tp1"` pour le calculer sur TP1).
 
-**Niveaux d'entrée possibles :** le milieu du FVG (prioritaire) ou l'extrémité de l'OB (le bord que le prix atteint en premier : le haut de l'OB pour un achat, le bas pour une vente). Le niveau doit être dans la zone 50-79 %.
+**Niveaux d'entrée :** le milieu du FVG (prioritaire) ou l'extrémité de l'OB, dans la zone 50-79 %.
 
 **Types d'ordres (selon la position du prix au moment du scan)**
-1. `BUY LIMIT` / `SELL LIMIT` : le milieu du FVG est choisi s'il n'a pas encore été atteint par le prix depuis la fin du FVG, si le prix a fait au plus 50 % du chemin entre ce niveau et TP1 (`MAX_PROGRESS`), et si le ratio à ce niveau est d'au moins 1 pour 3. Sinon, le même test est fait avec l'extrémité de l'OB. Le niveau choisi est indiqué entre parenthèses sur la ligne « Entrée ».
-2. `BUY` / `SELL` (ordre instantané, sans LIMIT) : le prix est dans l'OB et les niveaux limites ne sont plus disponibles. Entrée : prix actuel, ratio recalculé, minimum 1 pour 3.
-3. `BUY` / `SELL` avec la mention « ⏱ Entrée tardive » : le prix vient de quitter l'OB. Il faut qu'il ait touché l'OB depuis 2 bougies au plus (`LATE_CANDLES`), qu'il soit à moins d'une demi-hauteur d'OB du bord de l'OB (`LATE_DIST`), qu'il ait fait moins de 25 % du chemin entre ce bord et TP1 (`LATE_PROGRESS`), et que le ratio recalculé au prix actuel soit d'au moins 1 pour 3.
-4. Aucune alerte : le stop est franchi, TP1 est atteint, le ratio est inférieur à 1 pour 3, ou le prix est déjà trop loin après avoir quitté l'OB.
+1. `BUY LIMIT` / `SELL LIMIT` : le niveau n'a pas encore été atteint depuis la fin du FVG, le prix a fait au plus 50 % du chemin vers TP1 (`MAX_PROGRESS`) et le ratio est d'au moins 1 pour 3.
+2. `BUY` / `SELL` instantané : le prix est dans l'OB et les niveaux limites ne sont plus disponibles.
+3. `BUY` / `SELL` avec « ⏱ Entrée tardive » : le prix vient de quitter l'OB (`LATE_CANDLES`, `LATE_DIST`, `LATE_PROGRESS`).
+4. Aucune alerte : le stop est franchi, TP1 est atteint, le ratio est trop faible ou le prix est déjà trop loin.
 
-**Ordres limites en attente :** un message « ANNULER » est envoyé si TP1 est atteint sans exécution ou si le stop est franchi avant exécution. L'ordre en attente expire après 24 h. Une seule alerte est envoyée par impulsion.
+Une seule alerte est envoyée par impulsion (mémorisée 14 jours, `SENT_TTL`).
 
-**Suivi et backtest :** chaque alerte est suivie dans `trade_stats_impulse.json` (voir plus haut). Le gain est compté sur TP1, la cible du ratio de 1 pour 3. Le message de test affiche le résumé, et `python backtest.py --strategy impulse` rejoue la stratégie sur l'historique Deriv. Le suivi et le backtest enregistrent la zone de chaque setup (Golden Zone ou OTE) : c'est le moyen de savoir si la zone élargie à 50-79 % vaut mieux que l'OTE seule (`ZONE = (0.618, 0.79)`). Garde 50-79 % tant que tu n'as pas assez de trades résolus par zone, par exemple 30, sur plusieurs périodes.
+## Suivi des trades (`tracker.py`)
 
-## Lecture de la tendance (`bot.detect_trend`, `bot.trend_info`)
+Chaque alerte est enregistrée dans `trades.json`. À chaque scan, le bot compare les bougies récentes à tes niveaux et envoie un message à chaque étape :
 
-Une seule fonction lit la tendance de fond, pour le tag contre-tendance du CRT (D1), le filtre de tendance de l'Impulsion (timeframe de référence) et le récapitulatif hebdomadaire (D1 et W1). `detect_trend` renvoie `bullish`, `bearish`, `range` (ou rien si l'historique est trop court) ; `trend_info` renvoie en plus l'**âge** de la tendance. Trois règles, choisies par `TREND_MODE` dans `bot.py` :
+- **▶️ Ordre touché** : le prix a atteint l'entrée d'un ordre limite ou stop.
+- **🎯 TP1 atteint** : le suivi clôture 50 % de la position et remonte le stop à l'entrée (`PARTIAL_AT_TP1`, `BE_AT_TP1`).
+- **✅ TP2 atteint**, **❌ Stop touché** ou **➖ Stop à l'entrée touché** : le résultat est donné en R (multiple du risque).
+- **⚠️ ANNULER** : TP1 atteint sans exécution, stop franchi avant exécution, ou ordre expiré (24 h ; 48 h pour le CRT quand la LTF est le H1).
 
-- **`structure` (défaut, précoce).** Pivots confirmés 3 bougies après leur formation (`TREND_STRUCTURE_WINDOW`). La tendance est haussière si les deux derniers creux montent, si les deux derniers sommets montent **ou** si le dernier cours clôture au-dessus du dernier sommet (cassure de structure), et si le cours reste au-dessus du dernier creux. Baissière : le miroir. Elle demande 2 sommets et 2 creux, sans SMA, et elle s'arrête dès que le dernier creux (ou sommet) est cassé.
-- **`deplacement` (structure + cassure impulsive).** Même structure, mais la dernière cassure d'un sommet (celle qui a créé le dernier sommet plus haut, ou celle du dernier sommet par le cours) doit être **impulsive** : une clôture au-delà du pivot, avec un corps d'au moins 1,5 fois le corps moyen des 10 bougies précédentes **et** une clôture à au moins 0,25 ATR du pivot, sur la bougie de cassure ou la suivante. Une mèche qui dépasse sans clôture n'est pas une cassure. Réglages : `TREND_DISP_BODY_MULT`, `TREND_DISP_ATR_FRAC`, `TREND_DISP_REQUIRE_BOTH` (`False` : l'une des deux conditions seulement, filtre très léger), `TREND_DISP_CONFIRM`.
-- **`swings` (ancienne règle, tardive).** 3 sommets et 3 creux consécutifs dans le même sens, fenêtre de 4 bougies, prix du bon côté de la SMA 50. Pas d'âge.
+Le suivi suppose que tu as placé l'ordre exactement aux niveaux de l'alerte. Si le stop et une cible sont touchés dans la même bougie, le stop est compté en premier (hypothèse prudente). TP3 reste indicatif.
 
-Deux pivots consécutifs au même prix comptent pour un seul swing.
+Un bilan hebdomadaire est envoyé (résultats 7 et 30 jours, par stratégie et par cascade, trades actifs, entonnoir de filtres). En local ou dans les logs : `python bot.py --stats`.
 
-**Âge de la tendance (modes `structure` et `deplacement`).** Nombre d'alignements successifs de sommets ET de creux plus hauts (plus bas pour une baisse) : **naissante** (1), **établie** (2, ce que l'ancienne règle exigeait), **mûre** (3 et plus, `TREND_MATURE_SWINGS`). C'est une information, pas un filtre : elle figure dans le CSV du backtest (`age_tendance`, avec un tableau par âge dans le résumé), dans le suivi des trades et dans le récapitulatif hebdomadaire (`OUTLOOK_SHOW_AGE` dans `outlook.py`). Elle sert à mesurer si les trades pris en tendance mûre perdent plus.
+## Garde-fous (`guard.py`)
 
-**Mesures sur données fictives** (marches aléatoires et scénarios construits : à vérifier sur l'historique réel) :
+- **Un seul trade actif par actif et par sens.** Les alertes en double entre cascades (D1>H4>H1 et H4>H1>M15 sur le même mouvement) sont bloquées : la cascade la plus haute passe en premier.
+- **Exposition corrélée :** au plus 2 trades de même sens sur le dollar (forex et or comptent ensemble, un achat EURUSD équivaut à une vente USD) et 2 sur les cryptos (`GROUP_LIMIT`). Au plus 8 trades actifs en tout (`MAX_OPEN_TRADES`).
+- **Perte journalière :** après −3 R sur la journée de trading (qui démarre à 17h New York), plus aucune alerte jusqu'au lendemain (`MAX_DAILY_LOSS_R`). Un message prévient une fois.
+- **Fenêtres sans alerte (forex et or) :** rollover 16h55-17h15 New York, vendredi après 15h30, ouverture du dimanche 17h-18h, NFP (premier vendredi du mois, 8h-9h30). Les cryptos ne sont concernées que par `news.json`. Les indices synthétiques ne sont jamais bloqués.
+- **Calendrier de news :** copie `news.example.json` en `news.json` à la racine du dépôt, puis liste tes événements (FOMC, CPI, BCE…) avec leurs heures en UTC. `currencies` est facultatif (sans lui, tous les actifs réels sont concernés). Il n'y a pas de calendrier automatique : c'est à toi de le tenir à jour.
+- **Lot estimé :** si `ACCOUNT_BALANCE` est défini, chaque alerte affiche un lot. Les contrats sont supposés à 100 000 unités (forex), 100 oz (or) et 1 (cryptos). Pour un indice synthétique, renseigne la valeur de ta plateforme dans `LOT_UNITS_<SYMBOLE>` (par exemple `LOT_UNITS_R_75`), sinon aucun lot n'est calculé. C'est une estimation à vérifier sur ta plateforme avant d'ordonner.
+- **Surveillance :** un message prévient si le bot reprend après plus de 30 minutes d'arrêt, ou si Deriv ne renvoie aucune donnée pendant 3 scans de suite (et quand c'est rétabli). Si GitHub ne lance plus rien du tout, le bot ne peut pas le dire : active les notifications d'échec de ton cron externe.
+- **Entonnoir :** chaque scan compte combien de cascades passent chaque filtre (tendance, sweep, range, POI, cassure, trade valide, bloquées, alertes). Ces compteurs s'affichent dans les logs et le bilan. Un même setup peut être compté à plusieurs scans successifs.
 
-| Règle | Retard après un retournement impulsif | Retard après un retournement doux | Tendance annoncée sur marché sans dérive | Retournements par série de 1400 bougies |
-|---|---|---|---|---|
-| `structure` | 11 bougies | 20 | 63 % du temps | 41 |
-| `deplacement` | 11 | jamais détecté | 35 % | 19 |
-| `swings` | 23 | 44 | 25 % | 9 |
+## Backtest (`backtest.py`)
 
-Sur un marché fictif haussier avec dérive, `structure` annonce une tendance haussière 84 % du temps, `swings` 69 % et `deplacement` 65 %. Lecture : `deplacement` supprime une grande partie des faux départs de `structure` sans retarder les retournements impulsifs, mais il ignore les retournements progressifs et capte un peu moins de tendance. `structure` détecte le plus tôt et le plus souvent, au prix du bruit. Sur les Volatility Index, marchés simulés sans vraie tendance, aucune règle ne détecte quelque chose de réel. Aucun mode n'est « le bon » : compare-les sur l'historique réel avec `python backtest.py --trend-mode all` avant de choisir.
+Le backtest rejoue la stratégie sur de l'historique M5, avec les mêmes fonctions que le bot en direct, les mêmes garde-fous et la même gestion des trades. Les autres timeframes sont reconstruits depuis le M5 sans regarder le futur.
 
-**Changer de règle sans modifier le code :** crée une variable de dépôt `TREND_MODE` (Settings → Secrets and variables → Actions → Variables) avec la valeur `structure`, `deplacement` ou `swings`. Sans variable, c'est `structure`.
+**Depuis GitHub :** Actions → Backtest → Run workflow, avec l'actif (`R_75`, `frxEURUSD`…), le nombre de jours, la stratégie et le spread. Le rapport arrive sur Telegram et dans les logs.
 
-## Étude de prédictibilité (`bias_study.py`)
-
-Répond à la question : « la clôture d'une bougie D1 ou W1 permet-elle de prédire la direction de la suivante ? » sur l'historique Deriv (5000 bougies D1 par requête, 1500 par défaut). Pour chaque classe d'actif (Forex/Or, Crypto, Synthétiques) et chaque timeframe (D1, W1), elle teste sept règles de biais : clôture au-delà du plus haut ou plus bas précédent, clôture dans le tiers haut ou bas, direction de la bougie, bougie impulsive (corps d'au moins 1,5 fois la moyenne), et les trois lectures de tendance (`structure`, `deplacement`, `swings`). La cible est la direction de la bougie suivante, de l'ouverture à la clôture.
-
-**Contre les faux positifs :**
-- **Dérive neutralisée :** le taux attendu au hasard tient compte de la part de bougies haussières de l'échantillon. Un marché qui monte en moyenne ne rend pas un signal « acheteur » prédictif.
-- **Correction du nombre de tests (Holm)** : parmi des dizaines de combinaisons, certaines paraissent significatives par pur hasard.
-- **Validation hors échantillon :** la règle est choisie sur les 70 % de bougies les plus anciennes de chaque symbole, puis doit être confirmée, dans le même sens et avec p < 0,05, sur les 30 % les plus récentes.
-
-Une règle n'est « retenue » que si elle passe les trois contrôles, avec au moins 200 signaux en découverte et 100 en validation. Le résumé donne l'écart en points de pourcentage au-dessus du hasard, le nombre de symboles qui vont dans le même sens, et les règles les plus proches du seuil. Le CSV contient tous les tests.
-
-- **Sur GitHub :** Actions → CRT Bias Study → Run workflow, avec les classes (par défaut les trois) et le nombre de bougies D1 par symbole. Environ 1 minute pour les 29 actifs (11 du CRT et 18 indices synthétiques). Le résumé s'affiche dans la page de l'exécution et `bias_study.csv` est dans les artefacts.
-- **En local :** `python bias_study.py --classes crypto --max-bars 2000` (`--no-trend` ignore les règles de tendance, plus rapide).
-- **Testé sur données fictives :** sur 12 jeux de bruit pur, aucune règle n'a été retenue à tort ; une forte dérive haussière sans prédictibilité n'a rien produit non plus ; une autocorrélation injectée dans les cryptos a bien été détectée. C'est un test de la méthode, pas des marchés réels.
-- **Limites :** les symboles d'une même classe sont corrélés (les paires forex partagent le dollar), donc le test est optimiste : le nombre de symboles concordants et la validation sont les garde-fous. Un écart de 1 à 2 points ne couvre généralement pas le spread et le glissement. Un biais de direction ne dit rien de l'amplitude du mouvement. Les Volatility Index sont un tirage aléatoire sans mémoire : un signal « retenu » y serait suspect.
-
-## Récapitulatif hebdomadaire (`outlook.py`)
-
-Repris de pa-bot. Une fois par week-end, le bot envoie le biais directionnel de fond (D1 et W1) de chaque actif. Ce n'est pas une stratégie : c'est la même lecture de tendance que le tag contre-tendance du CRT (`bot.detect_trend`, voir « Lecture de la tendance »), sans niveaux d'entrée ni de sortie. C'est un repère pour préparer la semaine.
-
+**En local :**
 ```
-📅 Outlook de la semaine — 09:00 (UTC+1)
-
-Forex
-EURUSD : 🟢 Haussier (D1 · naissante) / 🟢 Haussier (W1 · mûre)
-GBPUSD : 🔴 Baissier (D1) / ⚪ Range (W1)
-
-Or
-XAUUSD : 🟢 Haussier (D1 · établie) / 🟢 Haussier (W1 · établie)
-
-Crypto
-BTCUSD : 🟢 Haussier (D1 · mûre) / ⚪ Range (W1)
-
-Indices synthétiques
-Volatility 75 : ⚪ Range (D1) / ⚪ Range (W1)
+python backtest.py --sym R_75 --source deriv --days 60 --spread-pct 0.01
+python backtest.py --sym frxEURUSD --source csv --file eurusd_m5.csv
+python backtest.py --sym R_75 --source sim --days 90      # marche aléatoire, contrôle de bon sens
 ```
+Le rapport donne le nombre de trades, le taux de gain, le total en R, le facteur de profit (PF), le drawdown maximal, et le détail par cascade, par sens, par âge de tendance (Impulsion), par session (CRT) et par type de sortie.
 
-- **Envoi :** dès la fermeture du forex (vendredi ~22h UTC), une seule fois par semaine ISO grâce au marqueur `weekly_outlook_state.json` (conservé par le cache du workflow). Si Telegram échoue, le marqueur n'est pas écrit et l'envoi est retenté au passage suivant.
-- **Mise à jour du dimanche :** les marchés 24/7 (cryptos et indices synthétiques) continuent de trader, donc leur lecture du vendredi vieillit. Un second message, limité à ces actifs, part le dimanche à partir de 20h UTC, avant la réouverture du forex (~22h UTC).
-- **Aucun coût hors week-end :** le script tourne à chaque passage du workflow mais se termine immédiatement tant qu'aucun envoi n'est dû, sans appel à Deriv.
-- **Données :** 500 bougies D1 par actif (le W1 demande plus d'historique que les 200 bougies du scan), lues une fois par week-end avec une date de fin explicite pour fonctionner marché fermé. Les messages sont coupés entre deux lignes au-delà de 3500 caractères.
-- **Lecture W1 :** la semaine en cours est comptée comme terminée, puisque le message part au week-end. La dernière bougie d'un actif forex ou or est considérée clôturée tant que le marché est fermé.
-- **Test :** lancer le workflow avec « test » envoie le récapitulatif tout de suite, sans toucher au marqueur : le vrai envoi du week-end n'est pas bloqué.
-- **Réglages (`outlook.py`) :** `OUTLOOK_INCLUDE_SYNTHETIC` (`False` retire les indices synthétiques), `OUTLOOK_SHOW_AGE` (`False` retire l'âge de la tendance), `REFRESH_HOUR_UTC`, `D1_COUNT`, `DISPLAY_TZ` (`Africa/Lagos` = UTC+1 fixe ; mets `Africa/Abidjan` pour UTC+0). Les horaires de fermeture du forex (`FOREX_CLOSE_UTC`, `FOREX_OPEN_UTC`) sont ceux de pa-bot, sans gestion du changement d'heure.
-- **Écart avec pa-bot :** son outlook retirait les bougies D1 forex qui suivent un weekend, donc tous les lundis, ce qui faussait les sommets, les creux et le W1. Cette étape n'est pas reprise ici.
+Pour juger une stratégie : plusieurs centaines de trades, plusieurs actifs, plusieurs périodes, et un spread réaliste. En dessous d'une cinquantaine de trades, les résultats sont du bruit. Le backtest suppose un spread constant, aucun glissement, et ne tient pas compte de `news.json`.
 
 ## Format des notifications
 
@@ -275,90 +149,53 @@ TP3  32408.44   (1:13.8)
 
 ✅ Golden Zone · OB 31828.1 - 31856.6
 ✅ Sweep  31819.75
+✅ Tendance établie · H1
+
+Lot  0.12  (risque 1 % de 1000)
+Gestion : 50 % à TP1, puis SL à l'entrée, le reste vise TP2
 ```
 
-Chaque TP affiche son ratio gain/risque, calculé depuis l'entrée prévue (le filtre de l'Impulsion porte sur TP1). Les prix sont arrondis au nombre de décimales de l'actif et envoyés en police à espacement fixe (balise `<code>`), copiables d'un toucher dans Telegram. L'en-tête d'un ordre instantané ne contient que `BUY` ou `SELL`. Il se termine par le nom de la stratégie (`CRT` ou `Impulsion`), y compris sur le message d'annulation. Les alertes CRT suivent le même style : le type d'ordre dans l'en-tête (`BUY LIMIT`, `SELL STOP`, ou `BUY`/`SELL` au marché) avec le timeframe de confirmation, la session sous l'en-tête (killzone, « hors killzone » ou « 24/7 »), la ligne Entrée avec son origine entre parenthèses (Order Block, Breaker Block, FVG 50 % ou clôture de la cassure), SL, TP1 à TP3 avec le ratio de chaque cible (le filtre de 1 pour 3 porte sur TP2), la ligne « Range » précédée de la référence (W1, D1 ou H4), puis ✅ sur le sweep, le FVG, l'OB et l'OTE le cas échéant, et enfin « 💧 Pool de liquidité balayé » et « ⚠️ Contre-tendance (D1) » ou « ⚠️ Corrélation » lorsqu'ils s'appliquent, puis, si renseignées, la ligne « 💼 Taille » et le rappel « 📌 Gestion ».
+Chaque TP affiche son ratio gain/risque depuis l'entrée prévue. Les prix sont arrondis au nombre de décimales de l'actif et envoyés en police à espacement fixe, copiables d'un toucher dans Telegram. La ligne « Lot » n'apparaît que si `ACCOUNT_BALANCE` est défini. Les alertes CRT suivent le même style : type d'ordre dans l'en-tête, session sous l'en-tête, ligne Entrée avec son origine (Order Block, Breaker Block, FVG 50 % ou clôture de la cassure), SL, TP1 à TP3, puis ✅ sur le sweep, le FVG, l'OB et l'OTE.
 
 ## Réglages principaux
 
 | Où | Constante | Effet |
 |---|---|---|
-| `bot.py` | `SYMBOLS` | Liste des actifs du CRT (11 : forex majeurs, or, cryptos) |
-| `bot.py` | `SYNTHETIC_SYMBOLS` | Liste des indices synthétiques (18), reprise par `impulse.py` |
-| `bot.py` | `REFERENCE_CONFIRMATION_MAP` | Référence (W1, D1, H4) et timeframe de confirmation associé |
-| `bot.py` | `STRUCTURE_SWING_WINDOW`, `DEFAULT_STRUCTURE_SWING_WINDOW` | Fenêtre des swings de la cassure de structure, par timeframe de confirmation |
-| `bot.py` | `TREND_SWING_WINDOW`, `TREND_SWING_COUNT`, `TREND_SMA_PERIOD` | Mode `swings` : fenêtre, nombre de swings et SMA de la tendance |
-| `bot.py` | `TREND_MODE` | Lecture de tendance : `structure` (précoce, défaut), `deplacement` (structure + cassure impulsive) ou `swings` (3 swings + SMA 50) ; peut être imposé par la variable de dépôt `TREND_MODE` |
-| `bot.py` | `TREND_DISP_BODY_MULT`, `TREND_DISP_ATR_FRAC`, `TREND_DISP_REQUIRE_BOTH`, `TREND_DISP_CONFIRM` | Mode `deplacement` : corps de la cassure (x corps moyen), distance au pivot (x ATR), les deux conditions ou une seule, bougies de validation |
-| `bot.py` | `TREND_MATURE_SWINGS` | Alignements successifs à partir desquels une tendance est « mûre » |
-| `bot.py` | `TREND_STRUCTURE_WINDOW` | Mode structure : bougies de confirmation d'un pivot |
-| `bot.py` | `KILLZONES_NY` | Noms et horaires des sessions (Asie, Londres, New York, London Close ; heure de New York) |
-| `bot.py` | `REQUIRE_KILLZONE_FOR_REAL_MARKETS` | `True` ignore les sweeps hors killzone (forex et or) |
-| `bot.py` | `KILLZONE_24_7` | `True` pour filtrer aussi les cryptos |
-| `bot.py` | `NY_ALIGNED` | Alignement 17h New York pour le forex et l'or (désactivé par défaut) |
-| `bot.py` | `WEEKEND_GAP_PREFIXES`, `WEEKEND_GAP_MULTIPLIER` | Filtre de gap de weekend |
-| `bot.py` | `LIQUIDITY_POOL_SWING_WINDOW`, `LIQUIDITY_POOL_TOLERANCE_PCT`, `STOP_LOSS_POOL_BUFFER_PCT` | Pools de liquidité et marge de SL associée |
-| `bot.py` | `STATE_MAX_AGE_DAYS` | Durée de conservation des verrous anti-doublon |
-| `outlook.py` | `OUTLOOK_INCLUDE_SYNTHETIC`, `REFRESH_HOUR_UTC`, `D1_COUNT`, `DISPLAY_TZ` | Récapitulatif hebdomadaire : actifs inclus, heure de la mise à jour du dimanche, historique lu, fuseau d'affichage |
-| `tracker.py` | `PENDING_MAX_AGE_DAYS`, `TRADE_MAX_OPEN_DAYS`, `TRADE_HISTORY_MAX_AGE_DAYS` | Expiration des ordres CRT jamais remplis, trade ouvert trop longtemps, durée de l'historique |
-| `bot.py` | `CASCADES` | Triplets de timeframes (utilisés par `impulse.py`, plus par le CRT) |
-| `bot.py` | `STOP_LOSS_BUFFER_PCT`, `STOP_LOSS_BUFFER_ATR`, `SPREAD_PCT`, `SLIPPAGE_PCT` | Marge du SL (% du prix, ATR), spread estimé, glissement estimé (backtest) |
-| `bot.py` | `CRT_MODE`, `STRICT_ENTRY`, `STRICT_OTE_ZONE`, `STRICT_OTE_LEVEL`, `STRICT_MID_LEVEL`, `STRICT_ENTRY_INSIDE_RANGE`, `STRICT_SL_BUFFER_ATR` | CRT strict (C2 clôturée) : mode, entrée, zone OTE, marge du SL (variables de dépôt `CRT_MODE`, `CRT_STRICT_ENTRY`) |
-| `bot.py` | `SESSION_SCHEDULE`, `SESSION_MIN_COVERAGE`, `SESSION_RANGE_MIN_ATR_D1`, `SESSION_RANGE_MAX_ATR_D1`, `SESSION_SWEEP_MAX_RANGE_FRAC`, `SESSION_SWEEP_MAX_ATR_D1` | CRT par sessions : horaires (`CRT_SESSION_SCHEDULE`), qualité du range asiatique et du sweep londonien |
-| `bot.py` | `REQUIRE_C2_CLOSE_INSIDE` | Valide que C2 finit dans le range de C1 |
-| `bot.py` | `SWEEP_MAX_RANGE_FRAC`, `SWEEP_MAX_ATR`, `SWEEP_MAX_AGE`, `SKIP_BOTH_SIDES_SWEPT` | Profondeur, fraîcheur et côté unique du sweep |
-| `bot.py` | `RANGE_MIN_ATR`, `RANGE_MAX_ATR` | Taille acceptée du range de C1 (en ATR de la référence) |
-| `bot.py` | `SKIP_MITIGATED`, `EXPIRY_REF_CANDLES`, `REF_GRAN` | Setup mitigé ignoré ; validité de l'ordre (fin de C3) |
-| `bot.py` | `HTF_FVG_LOOKBACK`, `HTF_FVG_TOL_ATR`, `REQUIRE_HTF_POI` | Zone d'intérêt HTF (FVG non comblé de la référence) |
-| `bot.py` | `ROLLOVER_FILTER`, `ROLLOVER_NY`, `NEWS_INCLUDE_CRYPTO`, `NEWS_WARN_MIN` | Rollover, annonces pour les cryptos, avertissement d'un trade ouvert |
-| `bot.py` | `MAX_OPEN_TRADES`, `MAX_DAILY_LOSS_R`, `MAX_WEEKLY_LOSS_R` | Limites de risque (suspension des alertes) |
-| `bot.py` | `MSS_REQUIRE_DISPLACEMENT`, `MSS_BODY_MULT`, `FVG_MIN_ATR_FRAC`, `FVG_DISP_BODY_MULT`, `REQUIRE_FVG` | Qualité de la cassure de structure et du FVG |
-| `bot.py` | `BLOCK_COUNTER_TREND`, `REQUIRE_PREMIUM_DISCOUNT` | Filtre contre-tendance D1 (désactivé), premium/discount (actif) |
-| `bot.py` | `NEWS_FILTER`, `NEWS_BLOCK_BEFORE_MIN`, `NEWS_BLOCK_AFTER_MIN`, `NEWS_FILE` | Filtre d'annonces (NFP automatique, `news.json` facultatif) |
-| `bot.py` | `MAX_CORRELATED_OPEN`, `CORRELATION_MODE` | Exposition corrélée (USD, cryptos) : avertissement ou retenue |
-| `bot.py` | `ACCOUNT_BALANCE`, `RISK_PCT`, `MANAGEMENT_NOTE` | Taille de position (variables de dépôt) et rappel de gestion |
-| `bot.py` | `H1_LONG_COUNT` | Bougies H1 lues pour reconstruire D1/H4 en mode `NY_ALIGNED` |
-| `bot.py` | `HOLIDAY_FILTER`, `HOLIDAYS_FILE` | Jours fériés du forex (variable `CRT_HOLIDAY_FILTER`) et fichier de dates supplémentaires |
-| `bot.py` | `NEWS_FEED`, `NEWS_FEED_URL`, `NEWS_FEED_TTL` | Flux d'annonces facultatif (variable `CRT_NEWS_FEED`) |
-| `bot.py` | `OBSTACLE_MODE`, `OBSTACLE_MARGIN` | Obstacles entre l'entrée et TP2 : off, flag ou cap (variable `CRT_OBSTACLE_MODE`) |
-| `bot.py` | `HEARTBEAT_HOUR_UTC`, `ERROR_REPEAT_HOURS`, `TRADE_NOTIFICATIONS` | Bilan quotidien (variable `CRT_HEARTBEAT_HOUR`, `off` pour désactiver), alerte d'erreur, notifications de gestion (variable `CRT_TRADE_NOTIFICATIONS`) |
-| `bot.py` | `SPREAD_SCALE`, `LOT_UNITS`, `COUNT_PROTECTED_TRADES`, `PRICE_FEED_NOTE` | Échelle des spreads (variable `CRT_SPREAD_SCALE`), unités par lot, comptage des trades sécurisés, rappel du flux Deriv |
-| `bot.py` | `TP_EXTENSION_PCT` | Prolongement de TP3 au-delà du bord opposé du range (% de la taille du range) |
-| `bot.py` | `MIN_RISK_REWARD` | Ratio minimum du CRT, calculé sur TP2 |
-| `bot.py` | `ORDER_TYPE_TOLERANCE_PCT` | Écart sous lequel le prix est « déjà sur la zone » (ordre au marché) |
-| `bot.py` | `OB_LOOKBACK` | Distance maximale (en bougies de confirmation) entre l'OB et la cassure |
-| `bot.py` | `REQUIRE_FIB_OTE` | Rend l'OTE obligatoire pour une alerte CRT |
-| `bot.py` | `MIN_INTERVAL`, `MAX_RETRIES` | Débit et nombre d'essais du client Deriv |
-| `impulse.py` | `SYMBOLS` | Actifs de la stratégie Impulsion (par défaut `SYNTHETIC_SYMBOLS`, 18 indices) |
-| `impulse.py` | `STRICT_TREND` | `True` : 3 swings + SMA 50 pour la tendance ; `False` : ancienne règle à 2 swings |
-| `impulse.py` | `ZONE` | Zone de retracement acceptée (0,5 à 0,79) |
-| `impulse.py` | `IMPULSE_ATR` | Taille minimale de la jambe (2 ATR) |
-| `impulse.py` | `MIN_RR` | Ratio gain/risque minimum (3 = 1 pour 3) |
-| `impulse.py` | `SL_BUFFER_ATR` | Tampon du stop-loss |
-| `impulse.py` | `MAX_PROGRESS` | Part maximale du chemin entrée → TP1 déjà parcourue pour un ordre limite (0,5 = 50 %) |
-| `impulse.py` | `LATE_CANDLES`, `LATE_DIST`, `LATE_PROGRESS` | Tolérance de l'entrée tardive (bougies, distance en hauteur d'OB, progression vers TP1) |
-| `impulse.py` | `FRESH` | Ancienneté maximale de la cassure LTF (en bougies) |
-| `impulse.py` | `PENDING_TTL` | Durée de vie d'un ordre limite en attente |
-| `impulse.py` | `STATS_FILE` | Fichier de suivi des trades de l'Impulsion |
-
-## Tests
-
-`python -m unittest discover -s tests -v` (à la racine du dépôt, sans accès réseau) rejoue des scénarios synthétiques (mode historique, CRT strict et CRT par sessions, jours fériés, flux d'annonces, obstacles, exposition, notifications, watchdog, outils du backtest) : setup valide, puis un rejet par garde-fou (C2 hors range, clôture hors range, cassure peu impulsive, sweep trop profond ou ancien, deux côtés balayés, range hors normes, entrée déjà retestée, expiration, premium/discount, zone d'intérêt HTF), le filtre d'annonces (NFP) et de rollover, les limites de risque, le calcul de taille, le suivi avec break-even et un passage complet de `main()` avec une API simulée. Le workflow « CRT Tests » les lance sur GitHub. Ils vérifient la logique, pas la rentabilité : seul le backtest et le suivi en direct renseignent là-dessus.
+| `bot.py` | `SYMBOLS` | Actifs du CRT (`CRT_SYNTHETIC=1` ajoute les indices) |
+| `bot.py` | `CASCADES` | Triplets de timeframes (partagés avec `impulse.py`) |
+| `bot.py` | `KILLZONES_NY`, `KILLZONE_24_7` | Sessions du CRT, et filtre éventuel sur les cryptos |
+| `bot.py` | `NY_ALIGNED` | Alignement 17h New York pour le forex et l'or |
+| `bot.py` | `STOP_LOSS_BUFFER_PCT`, `SL_BUFFER_ATR` | Marge du SL (le plus grand des deux) |
+| `bot.py` | `RANGE_MIN_ATR`, `RANGE_MAX_ATR` | Taille acceptée du range de référence |
+| `bot.py` | `TP_EXTENSION_PCT` | Prolongement de TP3 |
+| `bot.py` | `MIN_RISK_REWARD` | Ratio minimum du CRT, sur TP2 |
+| `bot.py` | `PENDING_TTL_FAST`, `PENDING_TTL_SLOW` | Validité d'un ordre en attente |
+| `bot.py` | `ORDER_TYPE_TOLERANCE_PCT`, `OB_LOOKBACK`, `REQUIRE_FIB_OTE` | Type d'ordre, distance de l'OB, OTE obligatoire |
+| `impulse.py` | `SYMBOLS` | Indices de l'Impulsion |
+| `impulse.py` | `ZONE`, `IMPULSE_ATR`, `IMPULSE_MAX_AGE` | Zone de retracement, taille et ancienneté de l'impulsion |
+| `impulse.py` | `TREND_AGES_OK`, `AGE_ESTABLISHED`, `AGE_MATURE`, `BOS_BY_CLOSE` | Filtre d'âge de tendance |
+| `impulse.py` | `FVG_DISP`, `FVG_MIN_ATR` | Déplacement et taille minimaux du FVG |
+| `impulse.py` | `RR_ON`, `MIN_RR`, `SL_BUFFER_ATR` | Ratio minimum et marge du stop |
+| `impulse.py` | `MAX_PROGRESS`, `LATE_CANDLES`, `LATE_DIST`, `LATE_PROGRESS` | Ordres limites et entrées tardives |
+| `impulse.py` | `PENDING_TTL`, `SENT_TTL`, `FRESH` | Validité d'un ordre, mémoire des alertes, fraîcheur de la cassure |
+| `tracker.py` | `PARTIAL_AT_TP1`, `BE_AT_TP1` | Gestion du trade après TP1 |
+| `guard.py` | `MAX_OPEN_TRADES`, `GROUP_LIMIT`, `MAX_DAILY_LOSS_R` | Limites de risque |
+| `guard.py` | `ROLLOVER`, `FRIDAY_CLOSE_FROM`, `SUNDAY_OPEN`, `NFP` | Fenêtres sans alerte |
+| `guard.py` | `GAP_ALERT_MIN`, `FAILS_ALERT`, `REPORT_EVERY` | Surveillance et bilan |
 
 ## Dépannage
 
-- **Erreurs « Handshake status 520 » :** l'endpoint Deriv refuse la connexion. Le bot alterne entre le nouvel et l'ancien endpoint. Si cela persiste, envoie les premières lignes du log.
-- **Aucun message Telegram :** vérifie que `TELEGRAM_TOKEN` n'est pas vide dans les logs (une valeur de secret remplie s'affiche `***`). Le log affiche « ATTENTION… message NON envoyé » si un secret manque.
-- **Pas de récapitulatif le week-end :** lance le workflow avec « test » pour vérifier l'envoi. Vérifie que `weekly_outlook_state.json` figure dans les chemins du cache de `crt.yml` et que l'étape `python outlook.py` y est présente.
-- **Suivi vide :** le résumé reste « aucun trade résolu » tant qu'aucun SL ni TP2 n'a été touché. Vérifie que `trade_stats.json` et `trade_stats_impulse.json` figurent dans les chemins du cache de `crt.yml`.
-- **Aucune alerte pendant des heures :** c'est normal. Toutes les conditions doivent être réunies, surtout avec le ratio de 1 pour 3.
-- **Plusieurs alertes au premier passage :** le CRT analyse tous les sweeps depuis l'ouverture du range de référence (jusqu'à une semaine pour le W1). Les setups déjà valides à ce moment-là sont envoyés une fois, puis verrouillés.
-- **Symbole absent :** lis la ligne « Symboles Deriv… » au début du log.
-- **Plus aucune exécution :** vérifie le tableau de bord du cron externe (réponse `204` attendue) et la date d'expiration du token GitHub.
+- **Erreurs « Handshake status 520 » :** l'endpoint Deriv refuse la connexion. Le bot alterne entre le nouvel et l'ancien endpoint.
+- **Aucun message Telegram :** vérifie que `TELEGRAM_TOKEN` n'est pas vide dans les logs. Le log affiche « ATTENTION… message NON envoyé » si un secret manque.
+- **Aucune alerte pendant des heures :** c'est normal. Lis la ligne « Entonnoir » dans les logs pour voir où les setups sont filtrés.
+- **Alerte absente alors que le setup semble valide :** vérifie le log (« Alerte bloquée… ») : un trade actif sur le même actif, une limite de risque ou la pause journalière peut l'avoir bloquée.
+- **Plus aucune exécution :** vérifie le tableau de bord du cron externe (réponse `204`) et la date d'expiration du token GitHub.
+- **Repartir de zéro :** supprime le cache GitHub Actions (onglet Actions → Caches) pour effacer `trades.json`, `guard.json` et les états.
 
 ## Limites et avertissements
 
-- Le code, y compris la stratégie reprise de l'ancien bot, a été testé sur des bougies fictives et avec un faux serveur. Il n'a pas été validé sur plusieurs jours de données réelles, et aucun backtest n'a été lancé sur des données réelles. Les réglages (2 ATR, déplacements, tailles de zone) peuvent demander des ajustements.
-- Les Volatility Index sont des marchés simulés par un algorithme, sans vrais participants. Les concepts ICT comme le sweep de liquidité reposent sur le comportement de vrais marchés : les signaux sur ces indices sont à prendre avec prudence.
+- Le code a été testé sur des bougies simulées (marche aléatoire), avec un faux serveur Deriv pour le scan en direct. Il n'a pas été validé sur de l'historique réel : lance le backtest sur plusieurs actifs avant de t'y fier.
+- Sur une marche aléatoire, le backtest ne montre aucun avantage statistique, ce qui est normal : les concepts de sweep et de structure supposent de vrais participants. Les Volatility Index sont générés par un algorithme, donc leurs signaux sont à prendre avec prudence jusqu'à ce qu'un backtest sur l'historique réel dise le contraire.
+- Pas repris : tag de contre-tendance, pools de liquidité (equal highs/lows), calendrier de news automatique, spread en direct, suivi de TP3.
 - Les alertes arrivent jusqu'à 5 minutes après la bougie (plus le délai de démarrage de GitHub Actions). Sur les indices 1s, le prix peut bouger entre l'alerte et ton ordre.
 - Ce projet n'est pas un conseil financier. Les résultats passés ou simulés ne garantissent rien. Teste d'abord sur un compte démo.

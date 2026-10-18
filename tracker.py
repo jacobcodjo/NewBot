@@ -1,275 +1,206 @@
-"""Suivi automatique des trades (CRT et Impulsion), repris de l'ancien crt-bot et adapté.
+"""Suivi des trades (CRT et Impulsion) : ordre en attente -> position ouverte -> résultat en R.
 
-Chaque alerte envoyée est enregistrée dans un fichier de statistiques (trade_stats.json pour le CRT,
-trade_stats_impulse.json pour l'Impulsion). Un ordre en attente (LIMIT/STOP) doit d'abord être rempli
-(le prix atteint l'entrée) ; un ordre au marché est rempli dès l'alerte. Une fois rempli, le premier
-niveau touché décide du résultat : SL (perdant) ou cible de gain (gagnant). La cible de gain est TP2
-pour le CRT (le ratio de 1 pour 3 est calculé sur TP2) et TP1 pour l'Impulsion (idem sur TP1) : champ
-`win` du setup. Si SL et cible sont touchés dans la même bougie, le SL est retenu ; sur la bougie de
-remplissage, seul le SL compte. Seules les bougies qui s'ouvrent après l'alerte comptent.
-Chaque trade mémorise la dernière bougie évaluée (`resume_epoch`) : il n'a donc pas besoin que
-l'historique récupéré remonte jusqu'à son ouverture. Ce module ne dépend pas de bot.py
-(usage partagé avec backtest.py).
+Le module est autonome (aucun import de bot.py) : il reçoit des bougies et renvoie des événements.
+Règles de gestion appliquées au suivi et au backtest :
+  - ordre en attente annulé si TP1 est atteint avant exécution, si une bougie clôture au-delà du stop,
+    ou si l'ordre dépasse sa durée de validité ;
+  - à TP1 : clôture de PARTIAL_AT_TP1 de la position et stop remonté à l'entrée (BE_AT_TP1) ;
+  - le reste de la position est clôturé à TP2 (TP3 reste indicatif) ;
+  - si le stop et une cible sont touchés dans la même bougie, le stop est supposé touché en premier.
 """
-import json, time
+import json
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-STATS_FILE = "trade_stats.json"
-PENDING_MAX_AGE_DAYS = 7           # ordre en attente jamais rempli après 7 jours -> EXPIRE (par défaut)
-TRADE_MAX_OPEN_DAYS = 30           # trade rempli toujours ouvert après 30 jours -> NON_RESOLU
-TRADE_HISTORY_MAX_AGE_DAYS = 180   # historique plus ancien purgé
-MARKET_ORDERS = ("BUY", "SELL")
+NY = ZoneInfo("America/New_York")
+PARTIAL_AT_TP1 = 0.5      # part de la position clôturée à TP1
+BE_AT_TP1 = True          # stop remonté à l'entrée une fois TP1 atteint
+KEEP_CLOSED = 1000        # nombre de trades clôturés conservés
+ACTIVE = ("pending", "open")
 
 
-def load_stats(path=STATS_FILE):
+def load_trades(path="trades.json"):
     try:
         with open(path) as f:
-            stats = json.load(f)
+            d = json.load(f)
+        d.setdefault("active", {})
+        d.setdefault("closed", [])
+        return d
     except Exception:
-        stats = {}
-    stats.setdefault("pending", {})
-    stats.setdefault("history", [])
-    return stats
+        return {"active": {}, "closed": []}
 
 
-def save_stats(stats, path=STATS_FILE):
+def save_trades(tr, path="trades.json"):
+    tr["closed"] = tr["closed"][-KEEP_CLOSED:]
     with open(path, "w") as f:
-        json.dump(stats, f, indent=1)
+        json.dump(tr, f)
 
 
-def new_trade(setup, alert_epoch):
-    """Trade à suivre, construit depuis un setup (clés : sym, dir, ref_n, conf_n, counter, trade{...}).
-    Champs optionnels du setup : win ('tp1' ou 'tp2', défaut tp2), max_age (secondes avant EXPIRE)."""
-    t = setup["trade"]
-    market = t["otype"] in MARKET_ORDERS
-    return {
-        "symbol": setup["sym"], "direction": setup["dir"],
-        "ref_tf": setup["ref_n"], "confirmation_tf": setup["conf_n"],
-        "order_type": t["otype"], "entry": t["entry"], "stop_loss": t["sl"],
-        "tp1": t["tp1"], "tp2": t["tp2"], "risk_reward": round(t["rr"], 2),
-        "win_tp": setup.get("win", "tp2"),
-        "max_age": setup.get("max_age", PENDING_MAX_AGE_DAYS * 86400),
-        "counter_trend": bool(setup.get("counter")),
-        "trend": setup.get("trend"), "trend_age": setup.get("trend_age"),
-        "zone": setup.get("zone"), "ote": t.get("ote"),
-        "alert_epoch": alert_epoch, "crt_mode": setup.get("mode", "loose"),
-        "filled": market, "fill_epoch": alert_epoch if market else None,
-        "tp1_hit": False, "be_hit": False,
-        "rr_tp1": round(abs(t["tp1"] - t["entry"]) / abs(t["entry"] - t["sl"]), 2)
-        if t["tp1"] and abs(t["entry"] - t["sl"]) > 0 else 0.0,
-    }
+def new_trade(bot, key, sym, name, d, otype, entry, sl, tp1, tp2, tp3, ltf, gran, dec,
+              cascade, now, ttl, extra=None):
+    """Crée l'enregistrement d'un trade. Un ordre au marché (BUY/SELL) est exécuté tout de suite."""
+    buy = d == "BUY"
+    market = otype in ("BUY", "SELL")
+    if tp1 is not None and ((buy and tp1 <= entry) or (not buy and tp1 >= entry)):
+        tp1 = None  # TP1 déjà dépassé à l'entrée : pas de clôture partielle
+    t = {"bot": bot, "key": key, "sym": sym, "name": name, "dir": d, "otype": otype,
+         "entry": entry, "sl": sl, "sl_now": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+         "ltf": ltf, "gran": gran, "dec": dec, "cascade": cascade, "t0": int(now), "ttl": ttl,
+         "status": "open" if market else "pending", "tp1_hit": False, "r1": None,
+         "r": None, "result": None, "seen": 0, "t_close": None}
+    if extra:
+        t.update(extra)
+    return t
 
 
-def add_pending(stats, key, setup, alert_epoch):
-    stats["pending"][key] = new_trade(setup, alert_epoch)
+def risk_of(t):
+    return abs(t["entry"] - t["sl"])
 
 
-def _start(trade, floor):
-    return max(floor, trade.get("resume_epoch", 0))
+def r_of(t, price):
+    """Gain en multiples du risque initial si la position est clôturée à `price`."""
+    risk = risk_of(t)
+    if risk <= 0:
+        return 0.0
+    gain = (price - t["entry"]) if t["dir"] == "BUY" else (t["entry"] - price)
+    return gain / risk
 
 
-def _fill_epoch(trade, candles):
-    """Epoch de la première bougie qui atteint l'entrée d'un ordre en attente, sinon None."""
-    entry, kind = trade["entry"], trade["order_type"]
-    start = _start(trade, trade["alert_epoch"])
-    limit = trade["alert_epoch"] + trade.get("max_age", PENDING_MAX_AGE_DAYS * 86400)
-    for c in candles:
-        if c["epoch"] < start:
+def _start_epoch(t):
+    """Première bougie à analyser : celle de la création pour un ordre en attente (le prix n'a pas
+    pu toucher l'entrée avant l'alerte), la suivante pour un ordre au marché."""
+    g, t0 = t["gran"], t["t0"]
+    if t["otype"] in ("BUY", "SELL"):
+        return -(-t0 // g) * g
+    return t0 // g * g
+
+
+def _close(t, r, result, now):
+    t["status"], t["r"], t["result"], t["t_close"] = "closed", round(r, 3), result, int(now)
+
+
+def advance(t, candles, now):
+    """Fait avancer le trade avec les bougies récentes. Retourne la liste des événements :
+    'filled', 'tp1', 'tp2', 'sl', 'be', 'cancel_tp', 'cancel_sl', 'expired'."""
+    ev = []
+    if t["status"] not in ACTIVE:
+        return ev
+    buy, g = t["dir"] == "BUY", t["gran"]
+    start, last_closed = _start_epoch(t), t["seen"]
+    for c in sorted(candles, key=lambda x: x["epoch"]):
+        if c["epoch"] < start or c["epoch"] + g <= t["seen"]:
             continue
-        if c["epoch"] > limit:
+        closed = c["epoch"] + g <= now
+        if t["status"] == "pending":
+            fill = {"BUY LIMIT": c["low"] <= t["entry"], "BUY STOP": c["high"] >= t["entry"],
+                    "SELL LIMIT": c["high"] >= t["entry"], "SELL STOP": c["low"] <= t["entry"]}[t["otype"]]
+            if fill:
+                t["status"] = "open"
+                ev.append("filled")
+            else:
+                if t["tp1"] is not None and ((c["high"] >= t["tp1"]) if buy else (c["low"] <= t["tp1"])):
+                    t["status"] = "cancelled"
+                    t["result"], t["t_close"] = "cancel_tp", int(now)
+                    ev.append("cancel_tp")
+                    break
+                if closed and ((c["close"] < t["sl"]) if buy else (c["close"] > t["sl"])):
+                    t["status"] = "cancelled"
+                    t["result"], t["t_close"] = "cancel_sl", int(now)
+                    ev.append("cancel_sl")
+                    break
+                if closed:
+                    last_closed = c["epoch"] + g
+                continue
+        # position ouverte (le stop remonté à l'entrée ne s'applique qu'aux bougies suivant TP1)
+        be_active = not (t["tp1_hit"] and c["epoch"] <= t.get("be_from", 0))
+        if be_active and ((c["low"] <= t["sl_now"]) if buy else (c["high"] >= t["sl_now"])):
+            if t["tp1_hit"]:
+                _close(t, PARTIAL_AT_TP1 * t["r1"], "TP1+BE", now)
+                ev.append("be")
+            else:
+                _close(t, -1.0, "SL", now)
+                ev.append("sl")
             break
-        if kind in ("BUY LIMIT", "SELL STOP"):
-            hit = c["low"] <= entry
-        elif kind in ("SELL LIMIT", "BUY STOP"):
-            hit = c["high"] >= entry
-        else:
-            hit = True
-        if hit:
-            return c["epoch"]
-    return None
+        if t["tp1"] is not None and not t["tp1_hit"] and \
+                ((c["high"] >= t["tp1"]) if buy else (c["low"] <= t["tp1"])):
+            t["tp1_hit"], t["r1"], t["be_from"] = True, r_of(t, t["tp1"]), c["epoch"]
+            if BE_AT_TP1:
+                t["sl_now"] = t["entry"]
+            ev.append("tp1")
+        if (c["high"] >= t["tp2"]) if buy else (c["low"] <= t["tp2"]):
+            r2 = r_of(t, t["tp2"])
+            part = PARTIAL_AT_TP1 * t["r1"] if t["tp1_hit"] else 0.0
+            rest = (1 - PARTIAL_AT_TP1) if t["tp1_hit"] else 1.0
+            _close(t, part + rest * r2, "TP2", now)
+            ev.append("tp2")
+            break
+        if closed:
+            last_closed = c["epoch"] + g
+    t["seen"] = max(t["seen"], last_closed)
+    if t["status"] == "pending" and now - t["t0"] > t["ttl"]:
+        t["status"] = "expired"
+        t["result"], t["t_close"] = "expired", int(now)
+        ev.append("expired")
+    return ev
 
 
-def migrate_trade(trade):
-    """Compatibilité : les trades enregistrés avant l'ajout de be_hit et rr_tp1 n'ont pas ces champs."""
-    trade.setdefault("be_hit", False)
-    if "rr_tp1" not in trade:
-        risk = abs(trade["entry"] - trade["stop_loss"])
-        trade["rr_tp1"] = round(abs(trade["tp1"] - trade["entry"]) / risk, 2) if trade.get("tp1") and risk > 0 else 0.0
+def archive(tr, key):
+    """Déplace un trade terminé de 'active' vers 'closed' (les ordres annulés/expirés ne comptent pas)."""
+    t = tr["active"].pop(key, None)
+    if t and t["status"] == "closed":
+        tr["closed"].append(t)
 
 
-def resolve_trade(trade, candles):
-    """Fait avancer un trade avec les bougies disponibles. Retourne 'TP', 'SL' ou None."""
-    if not candles:
+def active_list(tr):
+    return [t for t in tr["active"].values() if t["status"] in ACTIVE]
+
+
+def day_start(now):
+    """Début de la journée de trading : 17h New York."""
+    dt = datetime.fromtimestamp(now, NY)
+    s = dt.replace(hour=17, minute=0, second=0, microsecond=0)
+    if dt < s:
+        s -= timedelta(days=1)
+    return int(s.timestamp())
+
+
+def realized_r(tr, since):
+    return sum(t["r"] for t in tr["closed"] if t.get("t_close", 0) >= since and t.get("r") is not None)
+
+
+# --------------------------------------------------------------------------
+# Statistiques
+# --------------------------------------------------------------------------
+def summarize(ts):
+    rs = [t["r"] for t in ts if t.get("r") is not None]
+    if not rs:
         return None
-    migrate_trade(trade)
-    if not trade["filled"]:
-        fe = _fill_epoch(trade, candles)
-        if fe is None:
-            trade["resume_epoch"] = candles[-1]["epoch"]
-            return None
-        trade["filled"], trade["fill_epoch"], trade["fill_candle"] = True, fe, True
-    buy = trade["direction"] == "BUY"
-    win_level = trade[trade.get("win_tp", "tp2")]
-    start = _start(trade, trade["fill_epoch"])
-    for c in candles:
-        if c["epoch"] < start:
-            continue
-        on_fill = trade.get("fill_candle") and c["epoch"] == trade["fill_epoch"]
-        sl = c["low"] <= trade["stop_loss"] if buy else c["high"] >= trade["stop_loss"]
-        if sl:
-            if trade["tp1_hit"]:
-                trade["be_hit"] = True   # revenu au point d'entrée après TP1 : le SL géré (BE) aurait sorti la 2e moitié
-            trade["resolved_epoch"] = c["epoch"]
-            return "SL"
-        if on_fill:
-            continue  # bougie de remplissage : l'ordre des touches est inconnu, seul le SL est retenu
-        win = c["high"] >= win_level if buy else c["low"] <= win_level
-        tp1 = c["high"] >= trade["tp1"] if buy else c["low"] <= trade["tp1"]
-        if trade["tp1_hit"] and not trade["be_hit"] and not win:
-            # bougies suivant celle de TP1 : retour au point d'entrée = sortie à l'équilibre pour la gestion BE
-            if (c["low"] <= trade["entry"]) if buy else (c["high"] >= trade["entry"]):
-                trade["be_hit"] = True
-        if tp1 or win:
-            trade["tp1_hit"] = True
-        if win:
-            trade["resolved_epoch"] = c["epoch"]
-            return "TP"
-    trade["resume_epoch"] = candles[-1]["epoch"]
-    return None
+    wins, loss = [r for r in rs if r > 0], [r for r in rs if r < 0]
+    peak = dd = cum = 0.0
+    for r in rs:
+        cum += r
+        peak = max(peak, cum)
+        dd = max(dd, peak - cum)
+    return {"n": len(rs), "win": len(wins) / len(rs) * 100, "avg": sum(rs) / len(rs),
+            "total": sum(rs), "dd": dd,
+            "pf": (sum(wins) / -sum(loss)) if loss else float("inf")}
 
 
-def realized_r(h):
-    """Gain en R : -1 pour un SL, ratio de la cible de gain pour un TP."""
-    return -1.0 if h["result"] == "SL" else h["risk_reward"]
+def fmt_summary(label, s):
+    pf = "∞" if s["pf"] == float("inf") else f"{s['pf']:.2f}"
+    return (f"{label} : {s['n']} trades · {s['win']:.0f} % gagnants · {s['total']:+.1f} R "
+            f"(moy {s['avg']:+.2f} R) · PF {pf} · DD max {s['dd']:.1f} R")
 
 
-def managed_r(h):
-    """Gain en R avec la gestion « moitié à TP1, SL au point d'entrée, reste vers TP2 » (CRT, cible TP2) :
-    SL sans TP1 = -1 ; TP1 puis retour à l'entrée = 0,5 x R(TP1) ; TP2 atteint sans retour = 0,5 x R(TP1) + 0,5 x R(TP2).
-    Pour les autres cibles (Impulsion), identique à realized_r."""
-    if h.get("win_tp", "tp2") != "tp2" or not h.get("rr_tp1"):
-        return realized_r(h)
-    if h["result"] == "SL":
-        return 0.5 * h["rr_tp1"] if h.get("tp1_hit") else -1.0
-    if h.get("be_hit"):
-        return 0.5 * h["rr_tp1"]
-    return 0.5 * h["rr_tp1"] + 0.5 * h["risk_reward"]
-
-
-def _archive(stats, trade, result, when):
-    stats["history"].append({
-        "symbol": trade["symbol"], "direction": trade["direction"], "ref_tf": trade["ref_tf"],
-        "order_type": trade["order_type"], "counter_trend": trade["counter_trend"],
-        "risk_reward": trade["risk_reward"], "tp1_hit": trade["tp1_hit"],
-        "be_hit": trade.get("be_hit", False), "rr_tp1": trade.get("rr_tp1", 0.0),
-        "win_tp": trade.get("win_tp", "tp2"),
-        "zone": trade.get("zone"), "ote": trade.get("ote"),
-        "result": result, "alert_epoch": trade["alert_epoch"], "resolved_epoch": when,
-    })
-
-
-def resolve_pending(stats, candles_lookup):
-    """candles_lookup(symbol, confirmation_tf) -> bougies ou None. Retourne les clés archivées."""
-    done = []
-    for key, trade in stats["pending"].items():
-        candles = candles_lookup(trade["symbol"], trade["confirmation_tf"])
-        if not candles:
-            continue
-        seen = trade.get("resume_epoch")
-        if seen and candles[0]["epoch"] > seen:   # le bot est resté arrêté plus longtemps que l'historique
-            _archive(stats, trade, "NON_RESOLU", time.time())
-            done.append(key)
-            continue
-        result = resolve_trade(trade, candles)
-        if result:
-            _archive(stats, trade, result, trade["resolved_epoch"])
-            done.append(key)
-    for key in done:
-        del stats["pending"][key]
-    return done
-
-
-def expire_stale_pending(stats):
-    """EXPIRE : ordre jamais rempli après son délai. NON_RESOLU : trade rempli, ouvert depuis trop longtemps."""
-    now, n = time.time(), 0
-    for key, t in list(stats["pending"].items()):
-        age = now - t["alert_epoch"]
-        if not t["filled"] and age > t.get("max_age", PENDING_MAX_AGE_DAYS * 86400):
-            _archive(stats, stats["pending"].pop(key), "EXPIRE", now)
-            n += 1
-        elif t["filled"] and age > TRADE_MAX_OPEN_DAYS * 86400:
-            _archive(stats, stats["pending"].pop(key), "NON_RESOLU", now)
-            n += 1
-    return n
-
-
-def prune_history(stats):
-    cutoff = time.time() - TRADE_HISTORY_MAX_AGE_DAYS * 86400
-    before = len(stats["history"])
-    stats["history"] = [h for h in stats["history"] if h.get("resolved_epoch", time.time()) >= cutoff]
-    return before - len(stats["history"])
-
-
-def asset_class(symbol):
-    if symbol.startswith("frx"):
-        return "Forex/Or"
-    if symbol.startswith("cry"):
-        return "Crypto"
-    return "Synthétiques"
-
-
-def _rate(trades):
-    if not trades:
-        return None
-    wins = sum(1 for t in trades if t["result"] == "TP")
-    return round(100 * wins / len(trades), 1), len(trades)
-
-
-def summarize(stats, name="CRT", win="tp2"):
-    """Résumé texte (logs et message de test) : réussite, R moyen, contre-tendance, classe d'actif,
-    référence, taux de remplissage. Les EXPIRE et NON_RESOLU sont comptés à part. `win` : cible de
-    gain de la stratégie (tp2 pour le CRT, tp1 pour l'Impulsion) ; TP1 n'est affiché à part que pour tp2."""
-    history = stats.get("history", [])
-    resolved = [h for h in history if h["result"] in ("TP", "SL")]
-    expired = [h for h in history if h["result"] == "EXPIRE"]
-    unresolved = [h for h in history if h["result"] == "NON_RESOLU"]
-    n_pending = len(stats.get("pending", {}))
-    head = f"Suivi {name} : "
-    if not resolved and not expired:
-        return head + f"aucun trade résolu pour le moment ({n_pending} en cours)."
-    parts = []
-    if resolved:
-        wr = _rate(resolved)
-        r_avg = sum(realized_r(h) for h in resolved) / len(resolved)
-        g = f"Global : {wr[0]}% de réussite sur {wr[1]} trades, R moyen {r_avg:+.2f}"
-        if win == "tp2":
-            g += f", TP1 atteint {100 * sum(1 for h in resolved if h.get('tp1_hit')) / len(resolved):.0f}%"
-            g += f", R moyen géré (½ à TP1 + BE) {sum(managed_r(h) for h in resolved) / len(resolved):+.2f}"
-        parts.append(g)
-        ct = [h for h in resolved if h["counter_trend"]]
-        if ct:  # sans setup à contre-tendance (Impulsion), la comparaison n'a pas de sens
-            for label, sel in (("Contre-tendance", ct), ("Dans la tendance", [h for h in resolved if not h["counter_trend"]])):
-                r = _rate(sel)
-                if r:
-                    parts.append(f"{label} : {r[0]}% sur {r[1]}")
-        for cls in ("Forex/Or", "Crypto", "Synthétiques"):
-            r = _rate([h for h in resolved if asset_class(h["symbol"]) == cls])
-            if r:
-                parts.append(f"{cls} : {r[0]}% sur {r[1]}")
-        for zone in sorted({h.get("zone") for h in resolved if h.get("zone")}):   # Impulsion : Golden Zone / OTE
-            r = _rate([h for h in resolved if h.get("zone") == zone])
-            parts.append(f"Zone {zone} : {r[0]}% sur {r[1]}")
-        for label, val in (("dans l'OTE", True), ("hors OTE", False)):                # CRT : entrée dans l'OTE ou non
-            r = _rate([h for h in resolved if h.get("ote") is val])
-            if r and any(h.get("ote") is not None and h["ote"] is not val for h in resolved):
-                parts.append(f"Entrée {label} : {r[0]}% sur {r[1]}")
-        for ref in sorted({h.get("ref_tf") for h in resolved if h.get("ref_tf")}):
-            r = _rate([h for h in resolved if h.get("ref_tf") == ref])
-            parts.append(f"Référence {ref} : {r[0]}% sur {r[1]}")
-    if expired:
-        total = len(resolved) + len(expired)
-        parts.append(f"Remplissage : {round(100 * len(resolved) / total, 1)}% "
-                     f"({len(resolved)} résolus / {len(expired)} expirés)")
-    if unresolved:
-        parts.append(f"{len(unresolved)} non résolu(s)")
-    parts.append(f"{n_pending} en cours")
-    return head + " | ".join(parts)
+def stats_text(tr, now, days=30, groups=("bot", "cascade")):
+    ts = [t for t in tr["closed"] if t.get("t_close", 0) >= now - days * 86400]
+    s = summarize(ts)
+    if not s:
+        return f"Aucun trade clôturé sur {days} jours."
+    lines = [fmt_summary(f"Bilan {days} j", s)]
+    for g in groups:
+        for val in sorted({t.get(g) for t in ts if t.get(g)}):
+            sub = summarize([t for t in ts if t.get(g) == val])
+            if sub:
+                lines.append(fmt_summary(f"· {val}", sub))
+    return "\n".join(lines)

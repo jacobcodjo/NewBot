@@ -1,18 +1,23 @@
 """Stratégie Impulsion + retracement Fibonacci (zone 50 %-79 %) - Volatility Index Deriv.
 Cascade identique au CRT : (D1,H4,H1) (H4,H1,M15) (H1,M15,M5)
-  HTF : tendance (swings) | MTF : impulsion + Fibonacci | LTF : sweep -> MSS + FVG -> OB (zone 50 %-79 %)
-Le bot n'exécute aucun ordre : il envoie des alertes Telegram (ordre limite ou entrée immédiate).
+  HTF : tendance (2 swings, structure intacte, âge classé) | MTF : impulsion + Fibonacci
+  LTF : sweep -> MSS + FVG -> OB (zone 50 %-79 %)
+Le bot n'exécute aucun ordre : il envoie des alertes Telegram (ordre limite ou entrée immédiate),
+puis suit chaque trade (tracker.py) avec les garde-fous de guard.py.
 Les calculs sont écrits pour un achat ; pour une vente, les bougies sont inversées (prix * -1).
 """
-import os, time
-import tracker
-from bot import (Deriv, get_candles, load, save, notify, body_avg, swings, detect_trend, trend_info,
-                 SYNTHETIC_SYMBOLS, check_symbols,
-                 display_name, fmt, code, decimals, ratio_txt, GRAN, CASCADES, CACHE_FILE)
+import os, sys, time
+from collections import Counter
 
-SYMBOLS = list(SYNTHETIC_SYMBOLS)   # tous les indices synthétiques (liste dans bot.py) ; retire-en pour restreindre
+import guard as G
+import tracker as T
+from bot import (Deriv, get_candles, load, save, notify, body_avg, swings, atr, body, display_name, code,
+                 decimals, ratio_txt, mgmt_line, track_trades, emit_alert, finish_run, print_stats,
+                 GRAN, CASCADES, CACHE_FILE)
+
+SYMBOLS = ["R_10", "R_25", "R_50", "R_75", "R_100",
+           "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
 STATE_FILE = "impulse_state.json"
-STATS_FILE = "trade_stats_impulse.json"   # suivi des trades de l'Impulsion (tracker.py)
 
 ZONE = (0.5, 0.79)          # zone de retracement acceptée : 50 % -> 79 %
 GOLDEN_ZONE = (0.5, 0.618)  # étiquette "Golden Zone"
@@ -21,7 +26,6 @@ EXT = (1.272, 1.618)        # extensions pour TP2 / TP3
 IMPULSE_ATR = 2.0           # jambe d'impulsion >= 2 ATR
 IMPULSE_DISP = 1.5          # une bougie de la jambe >= 1,5 x corps moyen
 DISP = 1.2                  # déplacement de la bougie de cassure LTF
-ATR_N = 14
 SL_BUFFER_ATR = 0.15        # tampon du stop-loss (x ATR LTF)
 MIN_RR = 3.0                # ratio gain/risque minimum (1 pour 3)
 FRESH = 2                   # la cassure LTF doit dater des 2 dernières bougies clôturées
@@ -30,8 +34,15 @@ LATE_CANDLES = 2            # entrée tardive : le prix a quitté l'OB depuis 2 
 LATE_DIST = 0.5             # ... et se trouve à moins d'une demi-hauteur d'OB de son bord
 LATE_PROGRESS = 0.25        # ... et a fait moins de 25 % du chemin bord de l'OB -> TP1
 PENDING_TTL = 24 * 3600     # un ordre limite en attente expire après 24 h
-STRICT_TREND = True         # True : lecture de tendance de bot.detect_trend (règle choisie par TREND_MODE dans bot.py,
-                            # par défaut la structure de marché précoce) ; False : ancienne règle, 2 derniers sommets et creux plus hauts
+SENT_TTL = 14 * 86400       # une impulsion déjà alertée n'est pas réalertée avant 14 jours
+IMPULSE_MAX_AGE = 48        # l'extrême de l'impulsion doit dater de 48 bougies MTF clôturées au plus
+FVG_DISP = 1.5              # bougie centrale du FVG >= 1,5 x corps moyen (comme le CRT)
+FVG_MIN_ATR = 0.1           # taille minimale du FVG (x ATR LTF)
+RR_ON = "tp2"               # cible sur laquelle porte le ratio minimum : "tp1" ou "tp2" (comme le CRT)
+BOS_BY_CLOSE = True         # tendance : le dernier sommet doit être dépassé par une clôture (pas une simple mèche)
+AGE_ESTABLISHED = 2         # jambes consécutives (sommet + creux plus hauts) : 1 = naissante
+AGE_MATURE = 4              # >= 4 jambes = tendance mûre (proche de sa fin)
+TREND_AGES_OK = ("naissante", "établie")   # âges acceptés ; ajoute "mûre" pour tout accepter
 
 
 def flip(cs):
@@ -39,31 +50,47 @@ def flip(cs):
              "low": -c["high"], "close": -c["close"]} for c in cs]
 
 
-def atr(cs, n=ATR_N):
-    cs = cs[-(n + 1):]
-    trs = [max(c["high"] - c["low"], abs(c["high"] - p["close"]), abs(c["low"] - p["close"]))
-           for p, c in zip(cs, cs[1:])]
-    return sum(trs) / len(trs) if trs else 0
-
-
-def body(c):
-    return abs(c["close"] - c["open"])
-
-
 # --------------------------------------------------------------------------
-# 1) Tendance HTF : structure haussière (règle de bot.detect_trend si STRICT_TREND)
+# 1) Tendance HTF : sommets et creux plus hauts, structure intacte, âge classé
 # --------------------------------------------------------------------------
-def trend_up(htf):
-    if STRICT_TREND:
-        # même lecture de tendance que le CRT et le récapitulatif hebdomadaire (bot.detect_trend ; série retournée pour une vente)
-        return detect_trend(htf) == "bullish"
+def _run(vals):
+    """Nombre de hausses successives à la fin de la liste (ex : 1,2,3 -> 2)."""
+    n = 0
+    for a, b in zip(vals[-2::-1], vals[:0:-1]):
+        if b > a:
+            n += 1
+        else:
+            break
+    return n
+
+
+def trend_info(htf):
+    """Tendance haussière (écrite pour un achat) ou None.
+    - dernier sommet et dernier creux plus hauts que les précédents (2 swings suffisent) ;
+    - structure intacte : aucune clôture sous le dernier creux depuis sa formation ;
+    - dernier sommet dépassé par une clôture (BOS), pas seulement par une mèche ;
+    - âge = nombre de jambes consécutives (sommet + creux plus hauts) :
+      1 -> naissante, 2-3 -> établie, 4 et plus -> mûre."""
     h = htf[:-1]
     if len(h) < 12:
-        return False
+        return None
     sh, sl = swings(h, "high", len(h) - 1), swings(h, "low", len(h) - 1)
     if len(sh) < 2 or len(sl) < 2:
-        return False
-    return h[sh[-1]]["high"] > h[sh[-2]]["high"] and h[sl[-1]]["low"] > h[sl[-2]]["low"]
+        return None
+    highs, lows = [h[i]["high"] for i in sh], [h[i]["low"] for i in sl]
+    if not (highs[-1] > highs[-2] and lows[-1] > lows[-2]):
+        return None
+    if any(c["close"] < lows[-1] for c in h[sl[-1] + 1:]):
+        return None  # structure cassée : le dernier creux a été clôturé en dessous
+    if BOS_BY_CLOSE and not any(c["close"] > highs[-2] for c in h[sh[-2] + 1:]):
+        return None  # sommet dépassé seulement par une mèche
+    legs = max(1, min(_run(highs), _run(lows)))
+    age = "naissante" if legs < AGE_ESTABLISHED else "établie" if legs < AGE_MATURE else "mûre"
+    return {"age": age, "legs": legs}
+
+
+def trend_up(htf):
+    return trend_info(htf) is not None
 
 
 # --------------------------------------------------------------------------
@@ -79,6 +106,8 @@ def find_impulse(mtf):
         if len(rest) < 2 or min(x["low"] for x in rest) < m[o]["low"]:
             continue  # l'origine a été reprise par le prix
         e = o + 1 + max(range(len(rest)), key=lambda i: rest[i]["high"])
+        if len(m) - 1 - e > IMPULSE_MAX_AGE:
+            return None  # impulsion trop ancienne (les origines plus anciennes ont un extrême plus ancien encore)
         before = [s for s in highs if s < o]
         if not before:
             continue
@@ -117,8 +146,10 @@ def find_entry(ltf, imp, mtf_gran):
     touch = next((i for i, c in enumerate(m) if c["low"] <= zone[1] and c["high"] >= zone[0]), None)
     if touch is None or any(c["close"] < lo for c in m):
         return None  # zone jamais touchée, ou origine cassée
+    if any(c["close"] < zone[0] for c in m):
+        return None  # une clôture LTF au-delà de 79 % : retracement trop profond, setup annulé
 
-    found = None
+    cands = []
     for k in range(touch, len(m)):
         # sweep : la mèche prend un creux LTF (formé pendant le retracement) et referme au-dessus
         levels = [m[s]["low"] for s in swings(m[:k], "low", k - 1)[-3:]] if k >= 5 else []
@@ -135,10 +166,13 @@ def find_entry(ltf, imp, mtf_gran):
             avg = body_avg(m[max(0, j - 8):j])
             if avg and body(m[j]) < DISP * avg:
                 continue  # pas de déplacement
+            favg = body_avg(m[max(0, j - 8):j])
             i = next((ii for ii in (j, j + 1)
                       if 2 <= ii < len(m) and ii - 1 >= k
                       and m[ii]["low"] > m[ii - 2]["high"]
-                      and m[ii - 1]["close"] > m[ii - 1]["open"]), None)
+                      and m[ii]["low"] - m[ii - 2]["high"] >= FVG_MIN_ATR * a
+                      and m[ii - 1]["close"] > m[ii - 1]["open"]
+                      and (not favg or body(m[ii - 1]) >= FVG_DISP * favg)), None)
             if i is None:
                 continue  # pas de FVG
             ob_i = next((x for x in range(i - 2, k - 1, -1) if m[x]["close"] < m[x]["open"]), None)
@@ -147,20 +181,28 @@ def find_entry(ltf, imp, mtf_gran):
             ob = (m[ob_i]["low"], m[ob_i]["high"])
             if not (ob[0] <= zone[1] and ob[1] >= zone[0]):
                 continue  # l'OB doit chevaucher la zone 50 %-79 %
-            found = {"k": k, "i": i, "ob": ob, "fvg": (m[i - 2]["high"], m[i]["low"]),
-                     "sweep": max(swept), "sweep_low": m[k]["low"]}
-    if not found:
+            cands.append({"k": k, "i": i, "ob": ob, "fvg": (m[i - 2]["high"], m[i]["low"]),
+                          "sweep": max(swept), "sweep_low": m[k]["low"]})
+    if not cands:
         return None
+    # plusieurs combinaisons sweep/cassure possibles : on garde celle qui offre le meilleur ratio
+    best = [r for r in (_evaluate(c, m, ltf, zone, lo, hi, leg, a) for c in cands) if r]
+    return max(best, key=lambda r: r["rr"]) if best else None
 
+
+def _evaluate(found, m, ltf, zone, lo, hi, leg, a):
+    """Stop, cibles et type d'ordre d'un candidat. Retourne None si le trade est refusé."""
     ob, fvg, price = found["ob"], found["fvg"], ltf[-1]["close"]
     sl = found["sweep_low"] - SL_BUFFER_ATR * a
     tp1 = hi
+    tp2 = lo + EXT[0] * leg
     if price <= sl or price >= tp1:
         return None
     after = m[found["i"] + 1:] + [ltf[-1]]   # bougies depuis la fin du FVG, bougie en cours comprise
 
-    def rr_at(e):
-        return (tp1 - e) / (e - sl) if e > sl else 0
+    def rr_at(e):  # ratio gain/risque sur la cible choisie par RR_ON (TP2 par défaut, comme le CRT)
+        tp = tp2 if RR_ON == "tp2" else tp1
+        return (tp - e) / (e - sl) if e > sl else 0
 
     mode = entry = how = None
     # 1) ordre limite : milieu du FVG (prioritaire), sinon extrémité de l'OB, dans la zone et pas encore atteint
@@ -187,7 +229,7 @@ def find_entry(ltf, imp, mtf_gran):
     if mode is None:
         return None
     return {"mode": mode, "entry": entry, "how": how, "sl": sl, "tp1": tp1,
-            "tp2": lo + EXT[0] * leg, "tp3": lo + EXT[1] * leg,
+            "tp2": tp2, "tp3": lo + EXT[1] * leg,
             "rr": rr_at(entry), "ob": ob, "fvg": fvg, "zone": zone,
             "label": "Golden Zone" if (hi - entry) / leg < OTE[0] else "OTE",
             "sweep": found["sweep"], "price": price}
@@ -202,32 +244,7 @@ def unflip(r):
     return out
 
 
-# --------------------------------------------------------------------------
-# Ordres limites en attente : message d'annulation
-# --------------------------------------------------------------------------
-def check_pending(api, cache, pending):
-    for key, p in list(pending.items()):
-        if time.time() - p["t"] > PENDING_TTL:
-            del pending[key]
-            continue
-        c = get_candles(api, cache, p["sym"], p["gran"], force=True)
-        if not c:
-            continue
-        cs = [x for x in c if x["epoch"] + p["gran"] > p["t"]]
-        buy = p["dir"] == "BUY"
-        if any((x["low"] <= p["entry"]) if buy else (x["high"] >= p["entry"]) for x in cs):
-            del pending[key]  # ordre exécuté : plus rien à surveiller
-            continue
-        tp_hit = any((x["high"] >= p["tp1"]) if buy else (x["low"] <= p["tp1"]) for x in cs)
-        sl_hit = any((x["close"] < p["sl"]) if buy else (x["close"] > p["sl"]) for x in cs)
-        if tp_hit or sl_hit:
-            why = "TP1 atteint sans exécution" if tp_hit else "stop-loss franchi avant exécution"
-            notify(f"⚠️ ANNULER · {p['dir']} LIMIT · {p['name']} · {p['ltf']} · Impulsion\n"
-                   f"{why}\nEntrée prévue  {code(p['entry'], p.get('dec'))}", html=True)
-            del pending[key]
-
-
-def build_message(name, ltf_n, d, r, dec=None):
+def build_message(name, ltf_n, d, r, dec=None, trend=None, htf_n=None, sym=None):
     c = lambda v: code(v, dec)
     limit = r["mode"] == "LIMITE"
     label = f"{d} LIMIT" if limit else d
@@ -242,95 +259,93 @@ def build_message(name, ltf_n, d, r, dec=None):
               f"TP3  {c(r['tp3'])}{ratio_txt(d, r['entry'], r['sl'], r['tp3'])}", "",
               f"✅ {r['label']} · OB {c(r['ob'][0])} - {c(r['ob'][1])}",
               f"✅ Sweep  {c(r['sweep'])}"]
+    if trend:
+        lines.append(f"✅ Tendance {trend['age']} · {htf_n}")
+    extra = [x for x in (G.lot_line(sym, r["entry"], r["sl"]) if sym else None, mgmt_line()) if x]
+    if extra:
+        lines += [""] + extra
     return "\n".join(lines)
 
 
-def analyze(sym, get, now=None):
-    """Setups d'un symbole. get(tf, force=False) -> bougies du timeframe (la dernière est en formation).
-    Fonction pure vis-à-vis de l'état : utilisée par main() et par backtest.py."""
-    now = time.time() if now is None else now
+def scan_symbol(sym, provide, now, sent, funnel, align=False):
+    """Analyse un indice sur toutes les cascades. provide(tf, force=False) renvoie les bougies
+    (la dernière est en formation) ou None. align=True (backtest) : une cascade n'est évaluée que
+    quand sa bougie LTF vient de clôturer."""
     out = []
     for htf_n, mtf_n, ltf_n in CASCADES:
-        htf, mtf = get(htf_n), get(mtf_n)
+        if align and now % GRAN[ltf_n]:
+            continue
+        funnel["cascades"] += 1
+        htf, mtf = provide(htf_n), provide(mtf_n)
         if not htf or not mtf:
             continue
+        funnel["data"] += 1
         ltf = None
         for d in ("BUY", "SELL"):
             H, M = (htf, mtf) if d == "BUY" else (flip(htf), flip(mtf))
-            age = None
-            if STRICT_TREND:
-                info = trend_info(H)   # règle choisie par TREND_MODE dans bot.py ; série retournée pour une vente
-                if info["trend"] != "bullish":
-                    continue
-                age = info["age"]      # naissante / établie / mûre (None en mode swings)
-            elif not trend_up(H):
+            trend = trend_info(H)
+            if not trend or trend["age"] not in TREND_AGES_OK:
                 continue
+            funnel["trend"] += 1
             imp = find_impulse(M)
             if not imp:
                 continue
+            funnel["impulse"] += 1
             if ltf is None:
-                ltf = get(ltf_n, True) or []
+                ltf = provide(ltf_n, True) or []
             if not ltf or now - ltf[-1]["epoch"] > 3 * GRAN[ltf_n]:
                 continue
             r = find_entry(ltf if d == "BUY" else flip(ltf), imp, GRAN[mtf_n])
             if not r:
                 continue
+            funnel["trade"] += 1
             if d == "SELL":
                 r = unflip(r)
-            limit = r["mode"] == "LIMITE"
+            key = f"{sym}|{htf_n}>{mtf_n}>{ltf_n}|{d}|{imp['o_epoch']}|{imp['ext_epoch']}"
+            if key in sent:
+                continue  # une seule alerte par impulsion
+            name, dec = display_name(sym), decimals(ltf)
             out.append({
-                "sym": sym, "dir": d, "ref_n": htf_n, "conf_n": ltf_n, "r": r, "dec": decimals(ltf),
-                "key": f"{sym}|{htf_n}>{mtf_n}>{ltf_n}|{d}|{imp['o_epoch']}|{imp['ext_epoch']}",
-                "counter": False, "win": "tp1", "max_age": PENDING_TTL,
-                "trend": "bullish" if d == "BUY" else "bearish", "trend_age": age,
-                "zone": r["label"],   # "Golden Zone" (50-61,8 %) ou "OTE" (61,8-79 %)
-                "trade": {"otype": f"{d} LIMIT" if limit else d, "entry": r["entry"], "sl": r["sl"],
-                          "tp1": r["tp1"], "tp2": r["tp2"], "tp3": r["tp3"], "rr": r["rr"]},
-            })
+                "bot": "Impulsion", "key": key, "cascade": f"{htf_n}>{mtf_n}>{ltf_n}", "sym": sym,
+                "name": name, "dir": d, "ltf": ltf_n, "gran": GRAN[ltf_n], "dec": dec,
+                "price": r["price"], "otype": f"{d} LIMIT" if r["mode"] == "LIMITE" else d,
+                "entry": r["entry"], "sl": r["sl"], "tp1": r["tp1"], "tp2": r["tp2"],
+                "tp3": r["tp3"], "rr": r["rr"], "age": trend["age"], "ttl": PENDING_TTL,
+                "message": build_message(name, ltf_n, d, r, dec, trend, htf_n, sym)})
     return out
 
 
 def main():
-    cache, st, stats = load(CACHE_FILE), load(STATE_FILE), tracker.load_stats(STATS_FILE)
-    sent, pending = st.setdefault("sent", {}), st.setdefault("pending", {})
-    api, alerts = Deriv(), 0
+    if "--stats" in sys.argv:
+        print_stats()
+        return
+    now = time.time()
+    cache, st = load(CACHE_FILE), load(STATE_FILE)
+    sent = st.setdefault("sent", {})
+    tr, g = T.load_trades(), G.load_guard()
+    api, funnel = Deriv(), Counter()
     try:
-        check_symbols(api, SYMBOLS)
-        check_pending(api, cache, pending)
+        G.health_start(g, "Impulsion", now, notify)
+        track_trades(api, tr, "Impulsion", now)
         for sym in SYMBOLS:
-            get = lambda tf, force=False, sym=sym: get_candles(api, cache, sym, GRAN[tf], force=force)
-            for s in analyze(sym, get):
-                key, d, r = s["key"], s["dir"], s["r"]
-                if key in sent:
-                    continue  # une seule alerte par impulsion
-                now = int(time.time())
-                sent[key] = now
-                alerts += 1
-                name = display_name(sym)
-                notify(build_message(name, s["conf_n"], d, r, s["dec"]), html=True)
-                tracker.add_pending(stats, key, s, now)
-                if r["mode"] == "LIMITE":
-                    pending[key] = {"sym": sym, "name": name, "dir": d, "entry": r["entry"],
-                                    "sl": r["sl"], "tp1": r["tp1"], "ltf": s["conf_n"], "dec": s["dec"],
-                                    "gran": GRAN[s["conf_n"]], "t": now}
-        # suivi des trades : remplissage, SL / TP1, expiration, purge
-        lookup = lambda sym, tf: get_candles(api, cache, sym, GRAN[tf])
-        done = tracker.resolve_pending(stats, lookup)
-        expired, pruned = tracker.expire_stale_pending(stats), tracker.prune_history(stats)
-        if done or expired or pruned:
-            print(f"Suivi Impulsion : {len(done)} archivé(s), {expired} expiré(s), {pruned} purgé(s).")
-        summary = tracker.summarize(stats, "Impulsion", win="tp1")
-        print(f"Impulsion : scan terminé, {alerts} alerte(s), {len(pending)} ordre(s) en attente.")
-        print(summary)
+            provide = lambda tf, force=False, s=sym: get_candles(api, cache, s, GRAN[tf], force=force)
+            for a in scan_symbol(sym, provide, now, sent, funnel):
+                emit_alert(a, tr, g, sent, funnel, now, a["message"])
+        finish_run("Impulsion", g, tr, funnel, now)
+        pend = sum(1 for t in T.active_list(tr) if t["bot"] == "Impulsion" and t["status"] == "pending")
+        print(f"Impulsion : scan terminé, {funnel['alert']} alerte(s), {pend} ordre(s) en attente. "
+              f"Entonnoir : {G.funnel_text(funnel)}")
         if os.getenv("NOTIFY_OK") == "1":
-            notify(f"Impulsion OK : {len(SYMBOLS)} indices scannés, {alerts} alerte(s).\n{summary}")
+            notify(f"Impulsion OK : {len(SYMBOLS)} indices scannés, {funnel['alert']} alerte(s).\n"
+                   f"Entonnoir : {G.funnel_text(funnel)}")
     finally:
         api.close()
-        cut = time.time() - 7 * 86400
+        cut = time.time() - SENT_TTL
         st["sent"] = {k: v for k, v in sent.items() if v > cut}
         save(CACHE_FILE, cache)
         save(STATE_FILE, st)
-        tracker.save_stats(stats, STATS_FILE)
+        T.save_trades(tr)
+        G.save_guard(g)
 
 
 if __name__ == "__main__":
